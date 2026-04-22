@@ -86,7 +86,7 @@ Type: dirifempty; Name: "{userappdata}\CardLens\crashes"
 [Code]
 // LGPL v3 compliance note: PySide6/Qt DLLs are located in {app}\PySide6\
 // Users may replace them with a modified version to comply with LGPL v3.
-// Source code: https://github.com/cardlens/cardlens
+// Source code: https://github.com/webster586/cardlens
 
 // Show a note during uninstall that user data is preserved.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

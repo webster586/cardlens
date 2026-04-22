@@ -228,9 +228,8 @@ class AboutDialog(QDialog):
         # Source code link
         src_label = QLabel(
             'Quellcode (MIT-Lizenz): '
-            '<a href="https://github.com/cardlens/cardlens">'
-            "github.com/cardlens/cardlens</a>"
-            " <i>(Link aktualisieren sobald Repo live ist)</i>"
+            '<a href="https://github.com/webster586/cardlens">'
+            "github.com/webster586/cardlens</a>"
         )
         src_label.setAlignment(Qt.AlignCenter)
         src_label.setOpenExternalLinks(True)
