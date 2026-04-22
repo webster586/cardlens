@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.idea/
+.vscode/
+*.log
+logs/*
+!logs/.gitkeep
+crashes/*
+!crashes/.gitkeep
+cache/*
+!cache/.gitkeep
+exports/*
+!exports/.gitkeep
+runtime/*
+!runtime/.gitkeep
+data/*.db
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/catalog_images/
+
+# PyInstaller build output — never commit binaries
+dist/
+build/
+*.spec.bak
+installer/Output/
+
+# Secrets — settings.json can contain API keys
+runtime/settings.json
