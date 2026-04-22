@@ -55,7 +55,19 @@ You must agree to their Terms of Service when using this app.<br>
 <b>TCGPlayer API</b><br>
 Third-party web service operated by TCGPlayer, Inc. — not affiliated with Nintendo or The Pokémon Company.<br>
 Used for sealed-product pricing (ETB, Booster Bundle). Subject to their Terms of Service.<br>
-<a href="https://store.tcgplayer.com/legal">https://store.tcgplayer.com/legal</a>
+<a href="https://store.tcgplayer.com/legal">https://store.tcgplayer.com/legal</a><br><br>
+
+<b>Trading Card Game Trademarks</b><br>
+CardLens is not affiliated with or endorsed by any TCG publisher.<br>
+All trademarks, card artworks, and logos are property of their respective owners:<br>
+Pokémon TCG — Nintendo / The Pokémon Company International ·
+Magic: The Gathering — Wizards of the Coast LLC (Hasbro, Inc.) ·
+Yu-Gi-Oh! — Konami Digital Entertainment Co., Ltd. ·
+Disney Lorcana — The Walt Disney Company / Ravensburger AG ·
+One Piece Card Game / Dragon Ball Super Card Game / Digimon Card Game — Bandai Co., Ltd. ·
+Flesh and Blood — Legend Story Studios Ltd. ·
+Weiss Schwarz — Bushiroad Inc. ·
+KeyForge — Fantasy Flight Games / Asmodee Group.
 """
 
 _DISCLAIMER_TEXT = """\
@@ -68,9 +80,23 @@ Mit der Nutzung akzeptierst du deren \
 <a href="https://pokemontcg.io/terms">Nutzungsbedingungen</a>.<br>
 Ein eigener API-Key erhöht das Anfragen-Limit auf 20.000/Tag (kostenlos registrieren).<br><br>
 
-<b>2. Pokémon-Markenzeichen</b><br>
-Pokémon ist ein Markenzeichen von Nintendo / The Pokémon Company International.<br>
-Diese App hat keine offizielle Verbindung zu diesen Unternehmen.<br><br>
+<b>2. Markenzeichen der Kartenspiele (TCG)</b><br>
+CardLens hat <b>keine offizielle Verbindung</b> zu den folgenden Unternehmen.<br>
+Alle Markenzeichen, Karten-Artworks und Logos sind Eigentum ihrer jeweiligen Rechteinhaber
+und werden ausschließlich zur Identifikation verwendet.<br><br>
+
+• <b>Pokémon TCG</b> — Markenzeichen von Nintendo / The Pokémon Company International.<br>
+• <b>Magic: The Gathering</b> — Markenzeichen von Wizards of the Coast LLC (Hasbro, Inc.).<br>
+• <b>Yu-Gi-Oh!</b> — Markenzeichen von Konami Digital Entertainment Co., Ltd.<br>
+• <b>Disney Lorcana</b> — Markenzeichen von The Walt Disney Company / Ravensburger AG.<br>
+• <b>One Piece Card Game</b> — © Eiichiro Oda/Shueisha, Toei Animation — veröffentlicht von Bandai Co., Ltd.<br>
+• <b>Dragon Ball Super Card Game</b> — © Bird Studio/Shueisha, Toei Animation — Bandai Co., Ltd.<br>
+• <b>Digimon Card Game</b> — © Akiyoshi Hongo, Toei Animation — Bandai Co., Ltd.<br>
+• <b>Flesh and Blood</b> — Markenzeichen von Legend Story Studios Ltd.<br>
+• <b>Weiss Schwarz</b> — Markenzeichen von Bushiroad Inc.<br>
+• <b>KeyForge</b> — Markenzeichen von Fantasy Flight Games / Asmodee Group.<br><br>
+
+Alle weiteren Kartenspiel-Markenzeichen sind Eigentum ihrer jeweiligen Inhaber.<br><br>
 
 <b>3. Lizenz (eigener Code)</b><br>
 CardLens-eigener Quellcode steht unter der <b>MIT-Lizenz</b>.<br>
@@ -139,7 +165,7 @@ class DisclaimerDialog(QDialog):
 
         # Buttons
         buttons = QDialogButtonBox()
-        self._btn_accept = buttons.addButton("Akzeptieren & Starten", QDialogButtonBox.AcceptRole)
+        self._btn_accept = buttons.addButton("Akzeptieren && Starten", QDialogButtonBox.AcceptRole)
         self._btn_cancel = buttons.addButton("Abbrechen", QDialogButtonBox.RejectRole)
         self._btn_accept.setStyleSheet(
             "font-weight: bold; background-color: #2563eb; color: white; padding: 4px 16px;"

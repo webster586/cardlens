@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1 - 2026-04-22 - Security & Compliance
+
+### Security
+- `ui/catalog_dialog.py`: TCGPlayer-Key-Dialog — `pub_edit` erhält jetzt `EchoMode.Password` (beide Keys jetzt maskiert)
+- `ui/catalog_dialog.py`: Klartextwarnung im TCGPlayer-Key-Dialog (`settings.json` unverschlüsselt)
+- `core/logging_setup.py`: Log-Level des File-Handlers von `DEBUG` auf `INFO` geändert (rohe OCR-Texte / API-Antworten werden nicht mehr in Log-Dateien geschrieben)
+
+### Documentation
+- `README.md`: "Noch nicht enthalten"-Abschnitt entfernt; aktuellen Funktionsumfang, Datenschutz-Hinweise und Build-Anweisungen ergänzt
+- `ui/about_dialog.py`: Disclaimer-Text erweitert auf 10 TCG-Marken (Pokémon, MTG, Yu-Gi-Oh!, Lorcana, One Piece, Dragon Ball Super, Digimon, Flesh and Blood, Weiss Schwarz, KeyForge); Button-Text `&&`-Fix
+
 ## 0.4.0 - 2026-04-22 - Build & Installer Pipeline
 ### Added
 - `build.ps1`: PyInstaller-Build-Script mit optionalem `-Installer`-Flag fuer Inno Setup

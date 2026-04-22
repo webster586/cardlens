@@ -19,7 +19,7 @@ def configure_logging() -> None:
     )
 
     file_handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)  # INFO: avoids raw OCR text / API responses in log files
     file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()

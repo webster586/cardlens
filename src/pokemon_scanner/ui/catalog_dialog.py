@@ -2293,10 +2293,20 @@ class CatalogDialog(QDialog):
         info.setWordWrap(True)
         info.setStyleSheet("font-size:10px;color:#555;")
         lay.addWidget(info)
+        warn = QLabel(
+            "\u26a0\ufe0f Die Keys werden im Klartext in "
+            "<code>%APPDATA%\\CardLens\\runtime\\settings.json</code> gespeichert.<br>"
+            "Teile diese Datei nicht mit anderen Personen."
+        )
+        warn.setWordWrap(True)
+        warn.setTextFormat(Qt.RichText)
+        warn.setStyleSheet("font-size:10px; color:#b45309; background:#fef3c7; padding:4px; border-radius:4px;")
+        lay.addWidget(warn)
         from PySide6.QtWidgets import QFormLayout
         form = QFormLayout()
         pub_edit = QLineEdit(settings.tcgplayer_public_key or "")
         pub_edit.setPlaceholderText("Public Key")
+        pub_edit.setEchoMode(QLineEdit.Password)
         priv_edit = QLineEdit(settings.tcgplayer_private_key or "")
         priv_edit.setPlaceholderText("Private Key")
         priv_edit.setEchoMode(QLineEdit.Password)
