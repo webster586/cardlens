@@ -9,7 +9,7 @@ from src.pokemon_scanner.core.paths import DATA_DIR, RUNTIME_DIR
 
 @dataclass(slots=True)
 class AppSettings:
-    app_name: str = "Pokemon Scanner"
+    app_name: str = "CardLens"
     database_path: str = str(DATA_DIR / "pokemon_scanner.sqlite3")
     export_dir: str = str(Path("exports"))
     default_language: str = "en"

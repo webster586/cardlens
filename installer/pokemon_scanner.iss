@@ -10,7 +10,7 @@
 #define AppName    "CardLens"
 #define AppVersion "0.4.0"
 #define AppPublisher "CardLens Dev"
-#define AppURL ""
+#define AppURL "https://github.com/webster586/cardlens"
 #define AppExeName "CardLens.exe"
 #define DistDir    "..\dist\CardLens"
 

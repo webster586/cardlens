@@ -1,6 +1,8 @@
-# Pokemon Scanner App
+# CardLens
 
-Windows-Desktop-Projekt für das Erfassen von Pokémon-Karten über USB-Kamera oder Testfotos.
+Windows-Desktop-App zum Scannen, Identifizieren und Verwalten von Pokémon-Karten (USB-Kamera oder Fotos).
+
+**Quellcode & Lizenz:** [github.com/webster586/cardlens](https://github.com/webster586/cardlens) — MIT (eigener Code), LGPL v3 (PySide6/Qt)
 
 ## Zielbild
 

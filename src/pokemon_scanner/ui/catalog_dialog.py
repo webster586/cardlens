@@ -785,7 +785,7 @@ class _SetLogoDownloadWorker(QThread):
             safe = set_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
             dest = CATALOG_IMAGES_DIR / f"logo_{safe}.png"
             try:
-                resp = _r.get(url, headers={"User-Agent": "PokemonScanner/1.0"}, timeout=15)
+                resp = _r.get(url, headers={"User-Agent": "CardLens/1.0"}, timeout=15)
                 resp.raise_for_status()
                 dest.write_bytes(resp.content)
                 now = _dt.datetime.utcnow().isoformat()
@@ -804,7 +804,7 @@ class _SetLogoDownloadWorker(QThread):
             safe = set_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
             dest = CATALOG_IMAGES_DIR / f"symbol_{safe}.png"
             try:
-                resp = _r.get(url, headers={"User-Agent": "PokemonScanner/1.0"}, timeout=15)
+                resp = _r.get(url, headers={"User-Agent": "CardLens/1.0"}, timeout=15)
                 resp.raise_for_status()
                 dest.write_bytes(resp.content)
                 now = _dt.datetime.utcnow().isoformat()
@@ -1299,7 +1299,7 @@ class _SetReleaseWorker(QThread):
                     "orderBy": "-releaseDate",
                     "select": "id,name,releaseDate",
                 },
-                headers={"User-Agent": "PokemonScanner/1.0"},
+                headers={"User-Agent": "CardLens/1.0"},
                 timeout=20,
             )
             if not resp.ok:
@@ -1491,7 +1491,7 @@ class _BulkDownloadWorker(QThread):
                         "page":     page,
                         "orderBy":  "set.releaseDate,number",
                     },
-                    headers={"User-Agent": "PokemonScanner/1.0"},
+                    headers={"User-Agent": "CardLens/1.0"},
                     timeout=30,
                 )
                 resp.raise_for_status()

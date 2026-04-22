@@ -231,7 +231,7 @@ class CatalogRepository:
         try:
             resp = _req.get(
                 url,
-                headers={"User-Agent": "PokemonScanner/1.0"},
+                headers={"User-Agent": "CardLens/1.0"},
                 timeout=20,
                 stream=True,
             )
@@ -268,7 +268,7 @@ class CatalogRepository:
             try:
                 resp = _req.get(
                     url,
-                    headers={"User-Agent": "PokemonScanner/1.0"},
+                    headers={"User-Agent": "CardLens/1.0"},
                     timeout=15,
                 )
                 resp.raise_for_status()
@@ -297,7 +297,7 @@ class CatalogRepository:
             try:
                 resp = _req.get(
                     url,
-                    headers={"User-Agent": "PokemonScanner/1.0"},
+                    headers={"User-Agent": "CardLens/1.0"},
                     timeout=15,
                 )
                 resp.raise_for_status()

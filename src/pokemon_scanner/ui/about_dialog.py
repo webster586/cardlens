@@ -50,7 +50,12 @@ License: MIT<br>
 <b>pokemontcg.io API</b><br>
 Third-party web service — not affiliated with Nintendo or The Pokémon Company.<br>
 You must agree to their Terms of Service when using this app.<br>
-<a href="https://pokemontcg.io/terms">https://pokemontcg.io/terms</a>
+<a href="https://pokemontcg.io/terms">https://pokemontcg.io/terms</a><br><br>
+
+<b>TCGPlayer API</b><br>
+Third-party web service operated by TCGPlayer, Inc. — not affiliated with Nintendo or The Pokémon Company.<br>
+Used for sealed-product pricing (ETB, Booster Bundle). Subject to their Terms of Service.<br>
+<a href="https://store.tcgplayer.com/legal">https://store.tcgplayer.com/legal</a>
 """
 
 _DISCLAIMER_TEXT = """\
@@ -71,7 +76,12 @@ Diese App hat keine offizielle Verbindung zu diesen Unternehmen.<br><br>
 CardLens-eigener Quellcode steht unter der <b>MIT-Lizenz</b>.<br>
 Drittanbieter-Bibliotheken unterliegen ihren eigenen Lizenzen (LGPL, Apache 2.0, BSD).<br><br>
 
-<b>4. Datenspeicherung</b><br>
+<b>4. TCGPlayer API</b><br>
+Kartenwerte (ETB, Booster Bundle) werden über die <b>TCGPlayer API</b> abgerufen.<br>
+Du bist der Vertragspartner gegenüber TCGPlayer, Inc. — nicht der Entwickler dieser App.<br>
+Mit der Nutzung akzeptierst du deren <a href="https://store.tcgplayer.com/legal">Nutzungsbedingungen</a>.<br><br>
+
+<b>5. Datenspeicherung</b><br>
 Alle Daten (Sammlung, Logs) werden <b>lokal</b> auf deinem PC gespeichert.<br>
 Kartenbilder und Set-Logos werden von <b>pokemontcg.io</b> geladen und lokal
 in <code>%APPDATA%\CardLens\data\catalog_images\</code> gecacht, um wiederholte

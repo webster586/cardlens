@@ -106,7 +106,7 @@ class ImageDownloadWorker(QThread):
 
     def run(self) -> None:
         try:
-            req = urllib.request.Request(self._url, headers={"User-Agent": "PokemonScanner/1.0"})
+            req = urllib.request.Request(self._url, headers={"User-Agent": "CardLens/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = resp.read()
             pixmap = QPixmap()
