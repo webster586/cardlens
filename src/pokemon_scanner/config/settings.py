@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -44,12 +45,20 @@ class AppSettings:
         if not path.exists():
             settings = cls()
             settings.save()
-            return settings
-
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        known = {f.name for f in fields(cls)}
-        filtered = {k: v for k, v in raw.items() if k in known}
-        return cls(**filtered)
+        else:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            known = {f.name for f in fields(cls)}
+            filtered = {k: v for k, v in raw.items() if k in known}
+            settings = cls(**filtered)
+        # Environment variables take precedence over persisted values.
+        # This lets CI/deployment inject keys without touching the JSON file.
+        if key := os.environ.get("POKEMONTCG_API_KEY"):
+            settings.pokemontcg_api_key = key
+        if key := os.environ.get("TCGPLAYER_PUBLIC_KEY"):
+            settings.tcgplayer_public_key = key
+        if key := os.environ.get("TCGPLAYER_PRIVATE_KEY"):
+            settings.tcgplayer_private_key = key
+        return settings
 
     def save(self) -> None:
         self.settings_file().write_text(

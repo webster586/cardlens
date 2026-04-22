@@ -39,3 +39,4 @@ class CardCandidate:
     set_symbol_url: str = ""
     eur_price: float | None = None
     usd_price: float | None = None
+    api_id: str = ""

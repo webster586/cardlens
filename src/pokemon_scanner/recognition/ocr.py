@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import cv2
@@ -65,14 +66,18 @@ class OcrEngine:
     }
 
     # Regex for card number patterns like 055/088 or SV123 (require ≥2 digits for letter prefix)
-    import re as _re
-    _NUMBER_PATTERN = _re.compile(r'\b(\d{1,3}/\d{1,3}|[A-Z]{1,3}\d{2,4})\b')
+    _NUMBER_PATTERN = re.compile(r'\b(\d{1,3}/\d{1,3}|[A-Z]{1,3}\d{2,4})\b')
+
+    # frozenset of chars that appear in the CHAR_MAP for fast pre-check
+    _CHAR_MAP_KEYS = frozenset({
+        "\u2584", "\u2580", "\u2588", "\u258c", "\u2590",
+    })
 
     def extract_number(self, image_path: Path, card_img: np.ndarray | None = None) -> str | None:
         """Try to read the card number (e.g. '055/088') from the image.
         Returns the best match as a string, or None.
         """
-        base = card_img if card_img is not None else cv2.imread(str(image_path))
+        base = card_img if card_img is not None else cv2.imread(str(Path(image_path).resolve()))
         if base is None:
             return None
         reader = self._get_reader()
@@ -129,7 +134,7 @@ class OcrEngine:
             _LOG.warning("OCR name-zone CLAHE also failed, falling back to top-strip")
 
         # Use warped card if available so y-positions are reliable, else raw image
-        base_img = card_img if card_img is not None else cv2.imread(str(image_path))
+        base_img = card_img if card_img is not None else cv2.imread(str(Path(image_path).resolve()))
         if base_img is None:
             _LOG.error("Could not read image: %s", image_path)
             return {"name": "", "set": "", "number": ""}
@@ -254,7 +259,9 @@ class OcrEngine:
         return self._reorder_name(" ".join(filtered)).strip()
 
     def _clean(self, text: str) -> str:
-        return text.translate(self._CHAR_MAP).strip()
+        if any(c in self._CHAR_MAP_KEYS for c in text):
+            return text.translate(self._CHAR_MAP).strip()
+        return text.strip()
 
     # Known card type suffixes that belong at the end of the name
     _SUFFIXES = {"VMAX", "VSTAR", "GX", "EX", "V", "TAG", "TEAM", "LEGEND"}

@@ -185,6 +185,18 @@ class _CardTile(QFrame):
             vbox.addWidget(_lbl(f"Bei Scan: {sc:.2f}\u202f{cur}",
                                 "font-size:9px; color:#16a34a; font-weight:bold;"))
 
+        if owned_row:
+            _COND_COLOR = {"M": "#16a34a", "NM": "#16a34a", "LP": "#ca8a04", "MP": "#ea580c", "HP": "#dc2626"}
+            cond = (owned_row.get("condition") or "NM").upper()
+            cond_col = _COND_COLOR.get(cond, "#64748b")
+            cond_lbl = QLabel(f"Zustand: {cond}")
+            cond_lbl.setAlignment(Qt.AlignCenter)
+            cond_lbl.setStyleSheet(
+                f"font-size:9px; font-weight:bold; color:white; background:{cond_col};"
+                " border-radius:3px; padding:1px 5px; border:none;"
+            )
+            vbox.addWidget(cond_lbl)
+
         price = entry.get("best_price")
         cur2 = entry.get("price_currency") or "USD"
         prefix = "Heute: " if owned_row else ""
@@ -226,7 +238,7 @@ class _CardTile(QFrame):
 
 # ── Year-grouped set tiles ────────────────────────────────────────────────────
 _SET_TILE_W = 316
-_SET_TILE_H = 190
+_SET_TILE_H = 212
 
 
 class _SetHeaderTile(QFrame):
@@ -235,6 +247,7 @@ class _SetHeaderTile(QFrame):
 
     def __init__(
         self, set_name: str, logo_path: str | None, owned_count: int,
+        set_total: int = 0,
         p: QWidget | None = None,
     ) -> None:
         super().__init__(p)
@@ -302,6 +315,28 @@ class _SetHeaderTile(QFrame):
                 "font-weight:bold;border-radius:4px;border:none;"
             )
             bdg.move(_SET_TILE_W - 37, 4)
+        # Set completion progress bar
+        from PySide6.QtWidgets import QProgressBar
+        prog = QProgressBar()
+        prog.setRange(0, max(set_total, 1))
+        prog.setValue(min(owned_count, max(set_total, 1)))
+        prog.setFixedHeight(10)
+        prog.setTextVisible(False)
+        prog.setStyleSheet(
+            "QProgressBar{border:1px solid #c0ccdd;border-radius:4px;background:#e8edf4;}"
+            "QProgressBar::chunk{background:#2a9a2a;border-radius:3px;}"
+        )
+        lay.addWidget(prog)
+        if set_total > 0:
+            pct = int(owned_count / set_total * 100)
+            prog_lbl = QLabel(f"{owned_count}\u202f/\u202f{set_total}\u202f({pct}\u202f%)")
+        else:
+            prog_lbl = QLabel(f"{owned_count}\u202f Karten")
+        prog_lbl.setAlignment(Qt.AlignCenter)
+        prog_lbl.setStyleSheet(
+            "font-size:9px;color:#64748b;border:none;background:transparent;"
+        )
+        lay.addWidget(prog_lbl)
 
     def update_sealed_prices(self, prices: dict) -> None:
         """Update ETB/Bundle price labels. prices = {'etb': {'usd': x, 'eur': y}, ...}"""
@@ -503,8 +538,9 @@ class _YearSection(QWidget):
         cvbox.setContentsMargins(4, 6, 4, 4)
         cvbox.setSpacing(6)
         tiles: list[_SetHeaderTile] = []
-        for set_name, (logo_path, _, _, cnt) in self._sets.items():
-            t = _SetHeaderTile(set_name, logo_path, cnt)
+        for set_name, (logo_path, _, entries, cnt) in self._sets.items():
+            set_total = (entries[0].get("set_total") or 0) if entries else 0
+            t = _SetHeaderTile(set_name, logo_path, cnt, set_total)
             t.clicked.connect(self._on_set_clicked)
             tiles.append(t)
         self._tile_flow = _SetTileFlow(tiles)
@@ -1526,6 +1562,7 @@ class _BulkDownloadWorker(QThread):
                     price_currency = currency,
                     price_source   = ("Cardmarket" if eur is not None else "TCGPlayer") if price is not None else "",
                     notes          = f"ID: {card.get('id', '')}",
+                    api_id         = card.get('id', ''),
                     image_url      = img.get("small") or img.get("large") or "",
                     set_logo_url   = set_images.get("logo") or "",
                     rarity         = card.get("rarity", "") or "",
@@ -2070,6 +2107,39 @@ class _TopPerformerWidget(QWidget):
             hint.setWordWrap(True)
             hint.setStyleSheet("font-size:9px;color:#888;")
             lay.addWidget(hint)
+        # Condition editor (only for owned cards)
+        if owned_row:
+            _CONDS = ["M", "NM", "LP", "MP", "HP"]
+            cond_row = QHBoxLayout()
+            cond_lbl = QLabel("Zustand:")
+            cond_lbl.setStyleSheet("font-size:10px;border:none;background:transparent;")
+            cond_combo = QComboBox()
+            cond_combo.addItems(_CONDS)
+            current_cond = (owned_row.get("condition") or "NM").upper()
+            if current_cond in _CONDS:
+                cond_combo.setCurrentText(current_cond)
+            save_btn = QPushButton("Speichern")
+            save_btn.setFixedHeight(28)
+            entry_id: int | None = owned_row.get("id")
+            def _save_condition(*, _combo=cond_combo, _eid=entry_id, _dlg=dlg) -> None:
+                if _eid:
+                    self._col_repo.update_condition(_eid, _combo.currentText())
+                    # Refresh owned_lookup so badge updates on next open
+                    if api_id:
+                        updated = self._col_repo.find_by_identity(
+                            api_id=api_id, name=entry.get("name", ""),
+                            set_name=entry.get("set_name", ""),
+                            card_number=entry.get("card_number", ""),
+                            language=entry.get("language", ""),
+                        )
+                        if updated:
+                            self._owned_lookup[api_id] = updated
+                    _dlg.accept()
+            save_btn.clicked.connect(_save_condition)
+            cond_row.addWidget(cond_lbl)
+            cond_row.addWidget(cond_combo, 1)
+            cond_row.addWidget(save_btn)
+            lay.addLayout(cond_row)
         close_btn = QPushButton("Schlie\u00dfen")
         close_btn.clicked.connect(dlg.accept)
         lay.addWidget(close_btn)

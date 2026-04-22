@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -12,8 +13,9 @@ _LOG = logging.getLogger(__name__)
 _BASE_URL = "https://api.pokemontcg.io/v2/cards"
 _TIMEOUT = 20
 _CACHE_TTL = 120.0  # seconds — identical queries within 2 min reuse results
-# {query_string: (timestamp, results)}
-_fetch_cache: dict[str, tuple[float, list[CardCandidate]]] = {}
+_CACHE_MAX = 300    # max entries; LRU evicts oldest on overflow
+# {query_string: (timestamp, results)} — OrderedDict for O(1) LRU eviction
+_fetch_cache: OrderedDict[str, tuple[float, list[CardCandidate]]] = OrderedDict()
 
 
 class PokemonTcgAdapter:
@@ -115,6 +117,7 @@ class PokemonTcgAdapter:
         cached = _fetch_cache.get(q)
         if cached is not None and now - cached[0] < _CACHE_TTL:
             _LOG.debug("Cache hit for %r", q)
+            _fetch_cache.move_to_end(q)  # LRU: mark as recently used
             return list(cached[1])
 
         try:
@@ -152,6 +155,7 @@ class PokemonTcgAdapter:
                     price_currency=price_currency,
                     price_source=("Cardmarket" if eur is not None else "TCGPlayer") if best_price is not None else "",
                     notes=f"ID: {card.get('id', '')}",
+                    api_id=card.get('id', ''),
                     image_url=image_url,
                     set_logo_url=set_images.get("logo") or "",
                     rarity=card.get("rarity", "") or "",
@@ -170,6 +174,9 @@ class PokemonTcgAdapter:
                     usd_price=usd,
                 )
             )
+        # LRU eviction: discard oldest entry when cache is at max capacity
+        if len(_fetch_cache) >= _CACHE_MAX:
+            _fetch_cache.popitem(last=False)  # remove least-recently-used
         _fetch_cache[q] = (time.monotonic(), candidates)
         return candidates
 

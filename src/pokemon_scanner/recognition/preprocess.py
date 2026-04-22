@@ -63,7 +63,7 @@ class Preprocessor:
         crop = base[y1:y2, x1:x2]
         # Scale up for better OCR accuracy
         scale = max(1, int(200 / (y2 - y1)))
-        return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
     def _detect_card(self, img: np.ndarray) -> np.ndarray | None:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)

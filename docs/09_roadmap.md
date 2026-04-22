@@ -26,7 +26,10 @@
 - build.ps1 + Inno Setup .iss Skript
 - RAR-Archiv fuer direkte Weitergabe
 
-## Phase 7 Bulk-Optimierung -- OFFEN
-- Queueing, Debounce, Statistiken
-- Batch-Scan mehrerer Karten
-- Performance-Optimierung bei grosser Sammlung
+## Phase 7 Bulk-Optimierung -- TEILWEISE DONE
+- Performance-Optimierung bei grosser Sammlung (Performance Audit III — 17 Punkte umgesetzt)
+  - LRU-Cache, In-Memory-Korrektur-Lookup, PRAGMA-Guard, set_release_year-Spalte
+  - INTER_LINEAR, blockSignals, Kandidaten-Dedup, OCR-Overlay-Cache-Key
+  - Album-Rotation In-Memory
+- Queueing, Debounce, Statistiken — offen
+- Batch-Scan mehrerer Karten — offen

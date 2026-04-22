@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.2 - 2026-04-22 - Performance Audit III (17 Punkte)
+
+### Performance
+- `recognition/preprocess.py`: `INTER_CUBIC` → `INTER_LINEAR` bei `crop_name_zone()` — 2–3× schneller, kein OCR-Qualitätsverlust
+- `recognition/ocr.py`: `import re` aus Class-Body in Modul-Top; `_CHAR_MAP_KEYS` frozenset für O(1)-Prüfung; `_clean()` ruft `translate()` jetzt nur noch auf wenn tatsächlich Block-Zeichen im Text sind
+- `recognition/pipeline.py`: `imagehash`/`PIL`-Import und alle `name_translator`-/`CardCandidate`-Importe aus Hot-Paths in Modul-Top verschoben; `_dedup_by_api_id()` neu — alle Scan- und Suche-Rückgabepfade deduplizieren jetzt Kandidaten nach `api_id`
+- `datasources/pokemontcg.py`: Fetch-Cache von `dict` auf `OrderedDict`-LRU umgestellt — max 300 Einträge, `move_to_end` bei Cache-Hit, `popitem(last=False)` bei Overflow — O(1) statt O(n) Eviction
+- `db/repositories.py`: Modul-level `_schema_checked: set[str]` verhindert wiederholtes `PRAGMA table_info` bei jeder Instanz-Erstellung; `OcrCorrectionRepository` hält Top-500-Korrekturen in `_text_cache` im Speicher (Cache-Invalidierung nach `save_correction()`), `find_best_by_text()` liest damit kein DB-Roundtrip mehr pro Scan
+- `db/catalog_repository.py`: `_schema_checked`-Guard analog; neue Spalte `set_release_year INTEGER` wird bei Upsert befüllt; `get_top_performers()` nutzt `set_release_year` direkt statt `CAST(SUBSTR(set_release_date,1,4))` per Zeile; `search()` verwendet Prefix-LIKE (`name%`) statt `%name%` für Name-Suche
+- `ui/main_window.py`: `translate_de_to_en_fuzzy`, `CandidateMatcher`, `CATALOG_IMAGES_DIR` aus Hot-Path-Methoden in Modul-Top; `_fill_candidate_table()` mit `setUpdatesEnabled(False)` + `blockSignals(True)` umschlossen und auf max 15 Zeilen begrenzt; OCR-Overlay-Cache-Key ohne Pixmap-Dimensionen (Label ist immer 420×560)
+- `ui/album_scan_dialog.py`: `_rotate_image()` hält rotiertes Bild als `_rotated_cv_image: np.ndarray` im Speicher — Disk-Write nur noch einmal pro Winkel über `_get_or_write_rotated_path()`; veraltete doppelte Contour-Filter-Schleife in `_auto_detect()` entfernt
+
 ## 0.4.1 - 2026-04-22 - Security & Compliance
 
 ### Security

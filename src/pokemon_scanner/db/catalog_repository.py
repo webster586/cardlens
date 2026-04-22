@@ -5,12 +5,46 @@ import logging
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests as _req
 
 from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
 from src.pokemon_scanner.datasources.base import CardCandidate
 from src.pokemon_scanner.db.database import Database
+
+# Skip PRAGMA table_info once the catalog schema has been migrated in this process
+_schema_checked: set[str] = set()
+
+# Only download images from trusted pokemontcg.io hosts
+_ALLOWED_IMAGE_HOSTS: frozenset[str] = frozenset({
+    "images.pokemontcg.io",
+    "pokemontcg.io",
+    "api.pokemontcg.io",
+})
+_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 5 MB hard cap per image
+
+
+def _is_allowed_url(url: str) -> bool:
+    """Return True if *url* points to a whitelisted image host."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == h or host.endswith("." + h) for h in _ALLOWED_IMAGE_HOSTS)
+    except Exception:
+        return False
+
+
+# Module-level persistent HTTP session — avoids re-creating TCP connections for
+# each image download when saving many cards from the same host.
+_http_session: _req.Session | None = None
+
+
+def _get_http_session() -> _req.Session:
+    global _http_session
+    if _http_session is None:
+        _http_session = _req.Session()
+        _http_session.headers["User-Agent"] = "CardLens/1.0"
+    return _http_session
 
 _LOG = logging.getLogger(__name__)
 
@@ -29,6 +63,8 @@ class CatalogRepository:
 
     def _ensure_schema(self) -> None:
         """Create table if missing and run column migrations."""
+        if "card_catalog" in _schema_checked:
+            return
         with self.database.connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS card_catalog (
@@ -85,6 +121,7 @@ class CatalogRepository:
                 )
             """)
             self._migrate(conn)
+        _schema_checked.add("card_catalog")
 
     def _migrate(self, conn) -> None:
         """Add columns introduced after initial schema to existing DBs."""
@@ -95,7 +132,9 @@ class CatalogRepository:
             conn.execute("ALTER TABLE card_catalog ADD COLUMN set_local_logo_path TEXT")
         if "set_release_date" not in cols:
             conn.execute("ALTER TABLE card_catalog ADD COLUMN set_release_date TEXT")
-        new_cols = {
+        # Allowlist maps each migration column to its exact SQL type.  The f-string
+        # below is safe because both col_name and col_type come from this literal dict.
+        new_cols: dict[str, str] = {
             "rarity": "TEXT",
             "supertype": "TEXT",
             "subtypes": "TEXT",
@@ -111,9 +150,12 @@ class CatalogRepository:
             "set_symbol_local_path": "TEXT",
             "eur_price": "REAL",
             "usd_price": "REAL",
+            "set_release_year": "INTEGER",
         }
+        _safe_types = {"TEXT", "INTEGER", "REAL", "BLOB"}
         for col_name, col_type in new_cols.items():
-            if col_name not in cols:
+            # Double-check both names come from the allowlist (defence-in-depth)
+            if col_name not in cols and col_name in new_cols and col_type in _safe_types:
                 conn.execute(f"ALTER TABLE card_catalog ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
@@ -156,87 +198,119 @@ class CatalogRepository:
     def upsert_candidates(self, candidates: list[CardCandidate]) -> list[str]:
         """Save all candidates to card_catalog. Returns list of api_ids that need image download."""
         now = dt.datetime.utcnow().isoformat()
-        needs_download: list[str] = []
+
+        # Filter to candidates with a usable api_id
+        valid: list[tuple[CardCandidate, str]] = [
+            (c, aid) for c in candidates if (aid := _extract_api_id(c))
+        ]
+        if not valid:
+            return []
+
+        api_ids = [aid for _, aid in valid]
+        placeholders = ",".join("?" * len(api_ids))
 
         with self.database.connect() as conn:
-            for c in candidates:
-                api_id = _extract_api_id(c)
-                if not api_id:
-                    continue
-                existing = conn.execute(
-                    "SELECT api_id, local_image_path FROM card_catalog WHERE api_id = ?",
-                    (api_id,),
-                ).fetchone()
-                if existing:
-                    # Update price + metadata + timestamp
-                    conn.execute(
-                        """UPDATE card_catalog
-                           SET best_price=?, price_currency=?, image_url=?,
-                               set_logo_url=?, set_symbol_url=?,
-                               rarity=?, supertype=?, subtypes=?, hp=?, types=?,
-                               artist=?, pokedex_numbers=?, regulation_mark=?,
-                               legalities=?, set_series=?, set_total=?,
-                               eur_price=?, usd_price=?,
-                               updated_at=?
-                           WHERE api_id=?""",
-                        (c.best_price, c.price_currency, c.image_url,
-                         c.set_logo_url, c.set_symbol_url,
-                         c.rarity, c.supertype, c.subtypes, c.hp, c.types,
-                         c.artist, c.pokedex_numbers, c.regulation_mark,
-                         c.legalities, c.set_series, c.set_total,
-                         c.eur_price, c.usd_price,
-                         now, api_id),
-                    )
-                    if not existing["local_image_path"] and c.image_url:
+            # Single batch lookup — one round-trip instead of N
+            existing: dict[str, str | None] = {
+                row["api_id"]: row["local_image_path"]
+                for row in conn.execute(
+                    f"SELECT api_id, local_image_path FROM card_catalog WHERE api_id IN ({placeholders})",
+                    api_ids,
+                ).fetchall()
+            }
+
+            needs_download: list[str] = []
+            update_rows: list[tuple] = []
+            insert_rows: list[tuple] = []
+
+            for c, api_id in valid:
+                release_year: int | None = None
+                if c.set_release_date:
+                    try:
+                        release_year = int(c.set_release_date[:4])
+                    except (ValueError, TypeError):
+                        pass
+                if api_id in existing:
+                    update_rows.append((
+                        c.best_price, c.price_currency, c.image_url,
+                        c.set_logo_url, c.set_symbol_url,
+                        c.rarity, c.supertype, c.subtypes, c.hp, c.types,
+                        c.artist, c.pokedex_numbers, c.regulation_mark,
+                        c.legalities, c.set_series, c.set_total,
+                        c.eur_price, c.usd_price, release_year,
+                        now, api_id,
+                    ))
+                    if not existing[api_id] and c.image_url:
                         needs_download.append(api_id)
                 else:
-                    conn.execute(
-                        """INSERT INTO card_catalog
-                           (api_id, name, set_name, card_number, language,
-                            best_price, price_currency, image_url, local_image_path,
-                            set_logo_url, set_local_logo_path,
-                            rarity, supertype, subtypes, hp, types,
-                            artist, pokedex_numbers, regulation_mark,
-                            legalities, set_series, set_total,
-                            set_symbol_url, eur_price, usd_price,
-                            fetched_at, updated_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            api_id, c.name, c.set_name, c.card_number, c.language,
-                            c.best_price, c.price_currency, c.image_url, None,
-                            c.set_logo_url, None,
-                            c.rarity, c.supertype, c.subtypes, c.hp, c.types,
-                            c.artist, c.pokedex_numbers, c.regulation_mark,
-                            c.legalities, c.set_series, c.set_total,
-                            c.set_symbol_url, c.eur_price, c.usd_price,
-                            now, now,
-                        ),
-                    )
+                    insert_rows.append((
+                        api_id, c.name, c.set_name, c.card_number, c.language,
+                        c.best_price, c.price_currency, c.image_url, None,
+                        c.set_logo_url, None,
+                        c.rarity, c.supertype, c.subtypes, c.hp, c.types,
+                        c.artist, c.pokedex_numbers, c.regulation_mark,
+                        c.legalities, c.set_series, c.set_total,
+                        c.set_symbol_url, c.eur_price, c.usd_price, release_year,
+                        now, now,
+                    ))
                     if c.image_url:
                         needs_download.append(api_id)
+
+            if update_rows:
+                conn.executemany(
+                    """UPDATE card_catalog
+                       SET best_price=?, price_currency=?, image_url=?,
+                           set_logo_url=?, set_symbol_url=?,
+                           rarity=?, supertype=?, subtypes=?, hp=?, types=?,
+                           artist=?, pokedex_numbers=?, regulation_mark=?,
+                           legalities=?, set_series=?, set_total=?,
+                           eur_price=?, usd_price=?, set_release_year=?,
+                           updated_at=?
+                       WHERE api_id=?""",
+                    update_rows,
+                )
+            if insert_rows:
+                conn.executemany(
+                    """INSERT OR IGNORE INTO card_catalog
+                       (api_id, name, set_name, card_number, language,
+                        best_price, price_currency, image_url, local_image_path,
+                        set_logo_url, set_local_logo_path,
+                        rarity, supertype, subtypes, hp, types,
+                        artist, pokedex_numbers, regulation_mark,
+                        legalities, set_series, set_total,
+                        set_symbol_url, eur_price, usd_price, set_release_year,
+                        fetched_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    insert_rows,
+                )
             conn.commit()
         return needs_download
 
     def save_local_image(self, api_id: str, url: str) -> Path | None:
         """Download image from URL, save to catalog_images/{api_id}.jpg, update DB."""
-        if not url:
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+        if not _is_allowed_url(url):
+            _LOG.warning("Rejected image download from non-whitelisted host: %s", url)
             return None
         CATALOG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         safe_id = api_id.replace("/", "_").replace("\\", "_")
         dest = CATALOG_IMAGES_DIR / f"{safe_id}.jpg"
-        # Re-download if missing or zero-byte (partial write)
         if dest.exists() and dest.stat().st_size > 1024:
             self._update_local_path(api_id, dest)
             return dest
         try:
-            resp = _req.get(
-                url,
-                headers={"User-Agent": "CardLens/1.0"},
-                timeout=20,
-                stream=True,
-            )
+            resp = _get_http_session().get(url, timeout=20, stream=True)
             resp.raise_for_status()
-            dest.write_bytes(resp.content)
+            written = 0
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    written += len(chunk)
+                    if written > _MAX_DOWNLOAD_BYTES:
+                        _LOG.warning("Image download exceeded %d bytes, discarded: %s", _MAX_DOWNLOAD_BYTES, api_id)
+                        dest.unlink(missing_ok=True)
+                        return None
+                    fh.write(chunk)
             if dest.stat().st_size < 100:
                 dest.unlink(missing_ok=True)
                 _LOG.warning("Image too small after download, discarded: %s", api_id)
@@ -259,20 +333,27 @@ class CatalogRepository:
 
     def save_set_symbol(self, set_name: str, url: str) -> Path | None:
         """Download set symbol icon, cache locally, update all cards in this set."""
-        if not url:
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+        if not _is_allowed_url(url):
+            _LOG.warning("Rejected set symbol download from non-whitelisted host: %s", url)
             return None
         CATALOG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         safe_name = set_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
         dest = CATALOG_IMAGES_DIR / f"symbol_{safe_name}.png"
         if not dest.exists() or dest.stat().st_size < 100:
             try:
-                resp = _req.get(
-                    url,
-                    headers={"User-Agent": "CardLens/1.0"},
-                    timeout=15,
-                )
+                resp = _get_http_session().get(url, timeout=15, stream=True)
                 resp.raise_for_status()
-                dest.write_bytes(resp.content)
+                written = 0
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        written += len(chunk)
+                        if written > _MAX_DOWNLOAD_BYTES:
+                            dest.unlink(missing_ok=True)
+                            _LOG.warning("Set symbol download exceeded size limit: %s", set_name)
+                            return None
+                        fh.write(chunk)
             except Exception as exc:
                 _LOG.warning("Failed to download set symbol for %r: %s", set_name, exc)
                 return None
@@ -288,20 +369,27 @@ class CatalogRepository:
 
     def save_set_logo(self, set_name: str, url: str) -> Path | None:
         """Download set logo, cache locally, update all cards in this set."""
-        if not url:
+        if not url or not url.startswith(("http://", "https://")):
+            return None
+        if not _is_allowed_url(url):
+            _LOG.warning("Rejected set logo download from non-whitelisted host: %s", url)
             return None
         CATALOG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         safe_name = set_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
         dest = CATALOG_IMAGES_DIR / f"logo_{safe_name}.png"
         if not dest.exists() or dest.stat().st_size < 100:
             try:
-                resp = _req.get(
-                    url,
-                    headers={"User-Agent": "CardLens/1.0"},
-                    timeout=15,
-                )
+                resp = _get_http_session().get(url, timeout=15, stream=True)
                 resp.raise_for_status()
-                dest.write_bytes(resp.content)
+                written = 0
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        written += len(chunk)
+                        if written > _MAX_DOWNLOAD_BYTES:
+                            dest.unlink(missing_ok=True)
+                            _LOG.warning("Set logo download exceeded size limit: %s", set_name)
+                            return None
+                        fh.write(chunk)
             except Exception as exc:
                 _LOG.warning("Failed to download set logo for %r: %s", set_name, exc)
                 return None
@@ -347,7 +435,8 @@ class CatalogRepository:
         return [dict(r) for r in rows]
 
     def search(self, query: str) -> list[dict[str, Any]]:
-        q = f"%{query}%"
+        prefix_q = f"{query}%"
+        any_q = f"%{query}%"
         with self.database.connect() as conn:
             rows = conn.execute(
                 """SELECT api_id, name, set_name, card_number, language,
@@ -361,7 +450,7 @@ class CatalogRepository:
                    FROM card_catalog
                    WHERE name LIKE ? OR set_name LIKE ? OR card_number LIKE ?
                    ORDER BY set_name ASC, card_number ASC""",
-                (q, q, q),
+                (prefix_q, any_q, any_q),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -392,14 +481,10 @@ class CatalogRepository:
         wheres = ["best_price IS NOT NULL", "best_price > 0"]
         params: list = []
         if min_year:
-            wheres.append(
-                "CAST(COALESCE(SUBSTR(set_release_date,1,4),'0') AS INTEGER) >= ?"
-            )
+            wheres.append("COALESCE(set_release_year, 0) >= ?")
             params.append(min_year)
         if max_year:
-            wheres.append(
-                "CAST(COALESCE(SUBSTR(set_release_date,1,4),'9999') AS INTEGER) <= ?"
-            )
+            wheres.append("COALESCE(set_release_year, 9999) <= ?")
             params.append(max_year)
         if language:
             wheres.append("language = ?")
@@ -416,9 +501,7 @@ class CatalogRepository:
                    best_price, price_currency, local_image_path,
                    set_local_logo_path, set_release_date, fetched_at, updated_at,
                    CAST(best_price AS REAL) /
-                   MAX(1.0, {current_year} - CAST(
-                       COALESCE(SUBSTR(set_release_date,1,4),'{current_year}') AS INTEGER
-                   )) AS score
+                   MAX(1.0, {current_year} - COALESCE(set_release_year, {current_year})) AS score
             FROM card_catalog
             WHERE {where_sql}
             ORDER BY score DESC
@@ -533,6 +616,7 @@ class CatalogRepository:
                 price_currency="USD",
                 price_source="TCGPlayer" if row["best_price"] else "",
                 notes=f"ID: {row['api_id']}",
+                api_id=row['api_id'] or '',
                 image_url=img,
                 set_logo_url=row["set_logo_url"] or "",
             ))

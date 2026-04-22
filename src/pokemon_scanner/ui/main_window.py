@@ -11,6 +11,7 @@ from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QRect, Qt, QSize,
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -32,15 +33,18 @@ from src.pokemon_scanner.camera.camera_service import CameraService
 from src.pokemon_scanner.collection.service import CollectionService
 from src.pokemon_scanner.config.settings import AppSettings
 from src.pokemon_scanner.core.logging_setup import get_logger
-from src.pokemon_scanner.core.paths import EXPORT_DIR
+from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR, EXPORT_DIR
 from src.pokemon_scanner.datasources.base import CardCandidate
+from src.pokemon_scanner.datasources.name_translator import translate_de_to_en_fuzzy
 from src.pokemon_scanner.db.catalog_repository import CatalogRepository
 from src.pokemon_scanner.db.database import Database
-from src.pokemon_scanner.db.repositories import CollectionRepository
+from src.pokemon_scanner.db.repositories import CollectionRepository, OcrCorrectionRepository
 from src.pokemon_scanner.export.exporters import export_csv, export_json, export_xlsx
+from src.pokemon_scanner.recognition.matcher import CandidateMatcher
 from src.pokemon_scanner.recognition.ocr import OcrEngine
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
 from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, DisclaimerDialog
+from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog
 from src.pokemon_scanner.ui.catalog_dialog import CatalogDialog
 
 
@@ -105,10 +109,26 @@ class ImageDownloadWorker(QThread):
         self._url = url
 
     def run(self) -> None:
+        _MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap
         try:
             req = urllib.request.Request(self._url, headers={"User-Agent": "CardLens/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = resp.read()
+                cl = resp.headers.get("Content-Length")
+                if cl and int(cl) > _MAX_BYTES:
+                    self.finished.emit(QPixmap())
+                    return
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_BYTES:
+                        self.finished.emit(QPixmap())
+                        return
+                    chunks.append(chunk)
+            data = b"".join(chunks)
             pixmap = QPixmap()
             pixmap.loadFromData(data)
             self.finished.emit(pixmap)
@@ -173,21 +193,22 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.database = database
         self.logger = get_logger(__name__)
+        self.collection_service = CollectionService(CollectionRepository(database))
+        self.catalog_repo = CatalogRepository(database)
+        self.correction_repo = OcrCorrectionRepository(database)
         self.pipeline = RecognitionPipeline(
             database=database,
             pokemontcg_api_key=settings.pokemontcg_api_key,
+            correction_repo=self.correction_repo,
         )
-        self.collection_service = CollectionService(CollectionRepository(database))
-        self.catalog_repo = CatalogRepository(database)
         self.camera_service = CameraService()
-
-        self.current_image_path: str | None = None
         self.current_candidates: list[CardCandidate] = []
         self._scan_worker: ScanWorker | None = None
         self._manual_search_worker: ManualSearchWorker | None = None
         self._image_dl_workers: list[ImageDownloadWorker] = []
         self._catalog_save_workers: list[CatalogSaveWorker] = []
         self._active_lang: str = settings.preferred_language
+        self._collection_cols_sized: bool = False
 
         self._camera_timer = QTimer(self)
         self._camera_timer.timeout.connect(self._on_camera_frame)
@@ -203,8 +224,10 @@ class MainWindow(QMainWindow):
         self._watched_files: set[str] = set()
         self._is_watching: bool = False
         self._watch_timer = QTimer(self)
-        self._watch_timer.setInterval(2000)
+        self._watch_timer.setInterval(30000)  # fallback poll every 30s
         self._watch_timer.timeout.connect(self._poll_watch_folder)
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(lambda _: self._poll_watch_folder())
 
         # Region-draw OCR state
         self._region_mode: bool = False
@@ -213,6 +236,8 @@ class MainWindow(QMainWindow):
 
         # OCR overlay: last raw text read by OCR, shown on live camera frame
         self._last_ocr_raw: str = ""
+        self._ocr_overlay_cache: QPixmap | None = None
+        self._ocr_overlay_cache_key: str = ""
 
         self.setWindowTitle("CardLens")
         self.resize(1700, 900)
@@ -351,7 +376,7 @@ class MainWindow(QMainWindow):
 
         # --- Action row: scan + confirm + exports ---
         action_row = QHBoxLayout()
-        self.btn_scan = QPushButton("Scan starten")
+        self.btn_scan = QPushButton("Analyse starten")
         self.btn_confirm = QPushButton("Kandidat best\u00e4tigen")
         self.btn_export_csv = QPushButton("CSV Export")
         self.btn_export_json = QPushButton("JSON Export")
@@ -371,6 +396,11 @@ class MainWindow(QMainWindow):
         self.btn_catalog.setMinimumHeight(40)
         self.btn_catalog.setMinimumWidth(100)
         action_row.addWidget(self.btn_catalog)
+
+        self.btn_album_scan = QPushButton("\U0001f4f7  Scan Album")
+        self.btn_album_scan.setMinimumHeight(40)
+        self.btn_album_scan.setMinimumWidth(120)
+        action_row.addWidget(self.btn_album_scan)
         action_row.addStretch()
         main_layout.addLayout(action_row)
 
@@ -483,7 +513,7 @@ class MainWindow(QMainWindow):
         self.lbl_best_lang = QLabel("–")
         best_layout.addWidget(self.lbl_best_lang, 3, 1)
 
-        best_layout.addWidget(QLabel("Confidence:"), 4, 0)
+        best_layout.addWidget(QLabel("Konfidenz:"), 4, 0)
         self.lbl_best_conf = QLabel("–")
         best_layout.addWidget(self.lbl_best_conf, 4, 1)
 
@@ -499,7 +529,7 @@ class MainWindow(QMainWindow):
         candidate_layout = QVBoxLayout(candidate_group)
         self.candidate_table = QTableWidget(0, 7)
         self.candidate_table.setHorizontalHeaderLabels(
-            ["Quelle", "Name", "Set", "Nummer", "Sprache", "Confidence", "Preis"]
+            ["Quelle", "Name", "Set", "Nummer", "Sprache", "Konfidenz", "Preis"]
         )
         self.candidate_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.candidate_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -570,6 +600,7 @@ class MainWindow(QMainWindow):
         self.candidate_table.installEventFilter(self)
         self.lbl_card_image.installEventFilter(self)
         self.btn_catalog.clicked.connect(self._open_catalog)
+        self.btn_album_scan.clicked.connect(self._open_album_scan)
 
     def _populate_camera_combo(self) -> None:
         self.camera_combo.clear()
@@ -695,8 +726,17 @@ class MainWindow(QMainWindow):
         """Draw the last OCR raw text + best candidate name as overlay on *pixmap* (in-place)."""
         line1 = f"OCR: {self._last_ocr_raw}"
         line2 = f"\u2192 {self.current_candidates[0].name}" if self.current_candidates else "\u2192 kein Treffer"
+        cache_key = f"{line1}\n{line2}"
 
-        painter = QPainter(pixmap)
+        if self._ocr_overlay_cache is not None and self._ocr_overlay_cache_key == cache_key:
+            painter = QPainter(pixmap)
+            painter.drawPixmap(0, 0, self._ocr_overlay_cache)
+            painter.end()
+            return
+
+        overlay = QPixmap(pixmap.width(), pixmap.height())
+        overlay.fill(Qt.transparent)
+        painter = QPainter(overlay)
         font = QFont("Consolas", 10)
         font.setBold(True)
         painter.setFont(font)
@@ -716,6 +756,13 @@ class MainWindow(QMainWindow):
         painter.setPen(QColor(100, 255, 100))
         painter.drawText(x + pad, y + pad + line_h + pad + fm.ascent(), line2)
         painter.end()
+
+        self._ocr_overlay_cache = overlay
+        self._ocr_overlay_cache_key = cache_key
+
+        final_painter = QPainter(pixmap)
+        final_painter.drawPixmap(0, 0, overlay)
+        final_painter.end()
 
     def _capture_frame(self) -> None:
         frame = self.camera_service.grab_frame()
@@ -805,7 +852,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, candidates: list[CardCandidate], warp_path: str, raw_ocr: str = "") -> None:
         self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("Scan starten")
+        self.btn_scan.setText("Analyse starten")
         self.current_candidates = candidates
         self._last_ocr_raw = raw_ocr
         # Show warped card preview if detection succeeded
@@ -827,7 +874,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_error(self, message: str) -> None:
         self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("Scan starten")
+        self.btn_scan.setText("Analyse starten")
         self.status_label.setText(f"Fehler beim Scan: {message}")
         self.logger.error("Scan error: %s", message)
 
@@ -845,7 +892,6 @@ class MainWindow(QMainWindow):
         self.btn_manual_search.setText("Suche \u2026")
 
         # Detect German→English translation so we can show a hint in the status bar.
-        from src.pokemon_scanner.datasources.name_translator import translate_de_to_en_fuzzy
         translated = translate_de_to_en_fuzzy(query)
         if translated and translated.lower() != query.lower():
             self._manual_search_translated: str | None = translated
@@ -899,6 +945,17 @@ class MainWindow(QMainWindow):
         dlg = CatalogDialog(self.catalog_repo, self.collection_service.repository, self, settings=self.settings)
         dlg.exec()
 
+    def _open_album_scan(self) -> None:
+        dlg = AlbumScanDialog(
+            self.pipeline,
+            self.collection_service,
+            language=self._active_lang,
+            correction_repo=self.correction_repo,
+            catalog_repo=self.catalog_repo,
+            parent=self,
+        )
+        dlg.exec()
+
     def confirm_selected_candidate(self) -> None:
         row = self.candidate_table.currentRow()
         if row < 0 or row >= len(self.current_candidates):
@@ -938,12 +995,13 @@ class MainWindow(QMainWindow):
                     row_index, col_index,
                     QTableWidgetItem("" if value is None else str(value)),
                 )
-        self.collection_table.resizeColumnsToContents()
+        if not self._collection_cols_sized:
+            self.collection_table.resizeColumnsToContents()
+            self._collection_cols_sized = True
 
     def _price_label(self, candidate: CardCandidate) -> str:
         """Return a formatted price string, prefixed with 'EN Ref:' when the candidate
         language does not match the currently selected scan language."""
-        from src.pokemon_scanner.recognition.matcher import CandidateMatcher
         if candidate.best_price is None:
             return "–"
         currency = candidate.price_currency or "USD"
@@ -957,20 +1015,41 @@ class MainWindow(QMainWindow):
                 return f"EN Ref: {price_str}"
         return price_str
 
+    @staticmethod
+    def _conf_color(confidence: float) -> QColor:
+        """Return a background color reflecting OCR/match confidence."""
+        if confidence >= 0.75:
+            return QColor("#dcfce7")  # light green
+        if confidence >= 0.50:
+            return QColor("#fef9c3")  # light yellow
+        return QColor("#fee2e2")      # light red
+
     def _fill_candidate_table(self, candidates: list[CardCandidate]) -> None:
-        self.candidate_table.setRowCount(len(candidates))
-        for row_index, candidate in enumerate(candidates):
-            values = [
-                candidate.source,
-                candidate.name,
-                candidate.set_name,
-                candidate.card_number,
-                candidate.language,
-                f"{candidate.confidence:.2f}",
-                self._price_label(candidate),
-            ]
-            for col_index, value in enumerate(values):
-                self.candidate_table.setItem(row_index, col_index, QTableWidgetItem(value))
+        candidates = candidates[:15]  # cap at 15 rows — extra candidates add no value in UI
+        self.candidate_table.setUpdatesEnabled(False)
+        self.candidate_table.blockSignals(True)
+        try:
+            self.candidate_table.setRowCount(len(candidates))
+            for row_index, candidate in enumerate(candidates):
+                conf_pct = int(candidate.confidence * 100)
+                values = [
+                    candidate.source,
+                    candidate.name,
+                    candidate.set_name,
+                    candidate.card_number,
+                    candidate.language,
+                    f"{conf_pct} %",
+                    self._price_label(candidate),
+                ]
+                conf_bg = self._conf_color(candidate.confidence)
+                for col_index, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if col_index == 5:  # Konfidenz column
+                        item.setBackground(conf_bg)
+                    self.candidate_table.setItem(row_index, col_index, item)
+        finally:
+            self.candidate_table.blockSignals(False)
+            self.candidate_table.setUpdatesEnabled(True)
         self.candidate_table.resizeColumnsToContents()
         if candidates:
             self.candidate_table.selectRow(0)
@@ -985,11 +1064,16 @@ class MainWindow(QMainWindow):
         self.lbl_best_lang.setText(candidate.language or "–")
         conf_pct = int(candidate.confidence * 100)
         self.lbl_best_conf.setText(f"{conf_pct} %")
+        conf_style = (
+            "color: #15803d; font-weight: bold;" if candidate.confidence >= 0.75
+            else "color: #b45309; font-weight: bold;" if candidate.confidence >= 0.50
+            else "color: #dc2626; font-weight: bold;"
+        )
+        self.lbl_best_conf.setStyleSheet(conf_style)
         self.lbl_best_price.setText(self._price_label(candidate))
         # Show set logo in preview panel
         self.lbl_set_logo.clear()
         if candidate.set_name:
-            from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
             safe = (
                 candidate.set_name
                 .replace("/", "_").replace("\\", "_").replace(" ", "_")
@@ -1283,6 +1367,7 @@ class MainWindow(QMainWindow):
             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".heic", ".webp"}
         }
         self._is_watching = True
+        self._fs_watcher.addPath(self._watch_folder)
         self._watch_timer.start()
         self.btn_usb_watch.setText("📱 Watch STOP")
         self.btn_usb_watch.setStyleSheet("background-color: #dc2626; color: white; font-weight: bold; border: none; border-radius: 6px;")
@@ -1291,6 +1376,8 @@ class MainWindow(QMainWindow):
 
     def _stop_usb_watch(self) -> None:
         self._watch_timer.stop()
+        for p in self._fs_watcher.directories():
+            self._fs_watcher.removePath(p)
         self._is_watching = False
         self.btn_usb_watch.setText("📱 iPhone-Watch")
         self.btn_usb_watch.setStyleSheet("")
@@ -1375,7 +1462,34 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        self.collection_service.confirm_candidate(candidate, image_path=self.current_image_path)
+        # Ask for card condition
+        _CONDITIONS = ["M", "NM", "LP", "MP", "HP"]
+        cond_dlg = QDialog(self)
+        cond_dlg.setWindowTitle("Kartenzustand")
+        cond_dlg.setFixedSize(260, 110)
+        cond_lay = QVBoxLayout(cond_dlg)
+        cond_lay.setContentsMargins(12, 12, 12, 12)
+        cond_lay.setSpacing(8)
+        cond_lay.addWidget(QLabel("Zustand der physischen Karte:"))
+        cond_combo = QComboBox()
+        cond_combo.addItems(_CONDITIONS)
+        cond_combo.setCurrentText("NM")
+        cond_lay.addWidget(cond_combo)
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("Hinzuf\u00fcgen")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(cond_dlg.accept)
+        cancel_btn = QPushButton("Abbrechen")
+        cancel_btn.clicked.connect(cond_dlg.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        cond_lay.addLayout(btn_row)
+        if cond_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen_condition = cond_combo.currentText()
+        self.collection_service.confirm_candidate(
+            candidate, image_path=self.current_image_path, condition=chosen_condition
+        )
         # Record price snapshot for history chart
         if candidate.best_price and candidate.notes and candidate.notes.startswith("ID: "):
             _api_id = candidate.notes[4:].strip()

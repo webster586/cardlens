@@ -51,3 +51,18 @@ CREATE TABLE IF NOT EXISTS card_catalog (
     fetched_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ocr_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ocr_raw TEXT NOT NULL,
+    image_phash TEXT NOT NULL DEFAULT '',
+    correct_api_id TEXT NOT NULL,
+    correct_name TEXT NOT NULL,
+    correct_set_name TEXT NOT NULL DEFAULT '',
+    correct_card_number TEXT NOT NULL DEFAULT '',
+    used_count INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_ocr_corrections_raw ON ocr_corrections(ocr_raw);
