@@ -42,6 +42,13 @@
 - OCR-Overlay-Cache-Key ohne Pixmap-Dimensionen
 - Album-Rotation In-Memory (`_rotated_cv_image`)
 
+## Album & Sammlung UX -- erledigt 2026-04-23
+- Unified Image-Architektur: `ui/image_cache.py` — `card_image_path`, `resolve_card_image`, `load_card_pixmap`, `CardImageDownloadWorker`
+- Finish-Dropdown (11 Optionen) ersetzt Holo/Foil-Checkbox; DB-Migration mit Backfill
+- Album umbenennen via Doppelklick auf Albumtitel
+- Album-Seite Auto-Fill: `"{Albumname}, Seite {N}"` beim Einfügen (+) und Drag & Drop
+- `repositories.py`: `update_album_page()` + `get_slot_entry_id()`
+
 ## Offen
 - Bulk-Queue / Debounce
 - Batch-Statistiken

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.4 - 2026-04-23 - Album-Seite Auto-Fill
+
+### Added
+- `db/repositories.py`: `CollectionRepository.update_album_page(entry_id, album_page)` — schreibt nur das `album_page`-Feld (kein Read-Modify-Write nötig)
+- `db/repositories.py`: `AlbumRepository.get_slot_entry_id(album_id, page_num, slot_index)` — gibt `collection_entry_id` eines Slots zurück
+- `ui/album_widget.py`: `_AlbumSlot` und `_AlbumPageGrid` erhalten Parameter `album_name: str`; `_AlbumDetailView._rebuild_spread()` übergibt den aktuellen Albumtitel
+- `ui/album_widget.py`: `_on_add_clicked()` — füllt `album_page` nach `set_slot()` automatisch als `"{Albumname}, Seite {N}"`
+- `ui/album_widget.py`: `dropEvent()` — liest beide Entry-IDs vor dem Swap und setzt `album_page` für jede beteiligte Karte korrekt
+
+## 0.4.3 - 2026-04-23 - Album-Features & Image-Architektur
+
+### Added
+- `ui/image_cache.py` (neu): Unified Image-Modul — `card_image_path()`, `resolve_card_image()`, `load_card_pixmap()`, `CardImageDownloadWorker`; QPixmapCache auf 80 MB gesetzt
+- `ui/catalog_dialog.py`: Finish-Dropdown (11 Optionen: Normal, Holo, Reverse Holo, Full Art, Alt Art, Rainbow, Gold, Secret Rare, Promo, Shiny, Etched Holo) ersetzt Holo/Foil-Checkbox
+- `ui/album_widget.py`: Album-Umbenennen via Doppelklick auf den Albumtitel im Detailview-Header (`QInputDialog`)
+
+### Changed
+- `ui/catalog_dialog.py`, `ui/album_widget.py`, `ui/album_scan_dialog.py`, `ui/main_window.py`: alle Image-Lade-Pfade auf `image_cache.py` umgestellt — kein doppelter Cache-Code mehr
+- `db/repositories.py`: Migration ergänzt `finish TEXT DEFAULT ''`; Backfill `is_foil=1` → `finish='holo'`; `update_entry()` verwendet `finish` statt `is_foil`; `split_entry()` kopiert `finish`
+
+### Fixed
+- `ui/album_widget.py`: `mouseMoveEvent` nutzte `self._pixmap` statt `self._raw_pixmap` (Drag-Pixmap war leer)
+
 ## 0.4.2 - 2026-04-22 - Performance Audit III (17 Punkte)
 
 ### Performance

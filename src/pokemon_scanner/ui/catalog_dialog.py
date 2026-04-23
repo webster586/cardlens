@@ -7,20 +7,24 @@ import requests as _requests
 from PySide6.QtCore import Qt, QPointF, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QTabWidget, QVBoxLayout, QWidget,
+    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 from src.pokemon_scanner.db.catalog_repository import CatalogRepository
 from src.pokemon_scanner.db.repositories import CollectionRepository
 from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
+from src.pokemon_scanner.ui.image_cache import resolve_card_image
+from src.pokemon_scanner.ui.album_widget import AlbenWidget
+from src.pokemon_scanner.db.repositories import AlbumRepository
 
 _THUMB_W = 200
 _THUMB_H = 280
 _CARD_W = 216
 _CHECK = "\u2714"
-# Approximate tile height (margins + thumb + labels)
-_TILE_H = _THUMB_H + 150
+# Approximate tile height (margins + thumb + labels + selection row)
+_TILE_H = _THUMB_H + 196
 
 
 def _lbl(text: str, style: str = "") -> QLabel:
@@ -33,53 +37,358 @@ def _lbl(text: str, style: str = "") -> QLabel:
     return w
 
 
-def _resolve_image_path(stored: str | None) -> str | None:
-    """Return a usable file path for *stored*, or None if not found.
-
-    Falls back to CATALOG_IMAGES_DIR/<filename> so the frozen EXE (which has
-    catalog_images/ next to it) works even when the DB still contains absolute
-    dev-machine paths.
-    """
-    if not stored:
-        return None
-    p = Path(stored)
-    if p.exists():
-        return stored
-    fallback = CATALOG_IMAGES_DIR / p.name
-    if fallback.exists():
-        return str(fallback)
-    return None
-
-
-# Module-level pixmap cache: path + dimensions → already-scaled QPixmap.
-# Avoids repeated disk reads + GPU uploads when the same logo/symbol is used
-# multiple times per catalog rebuild (header strip + tile grid = 3× per set).
-_px_cache: dict[str, QPixmap] = {}
-
-
 def _cached_pixmap(path: str, height: int, width: int = 0) -> QPixmap:
-    """Return a scaled QPixmap, loaded once and cached for the process lifetime."""
-    key = f"{path}:{width}x{height}"
-    if key not in _px_cache:
-        if width > 0:
-            _px_cache[key] = QPixmap(path).scaled(
-                width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation
+    """Return a scaled QPixmap for logos/symbols, via Qt's global QPixmapCache."""
+    key = f"logo_{path}:{width}x{height}"
+    pm = QPixmapCache.find(key)
+    if pm:
+        return pm
+    if width > 0:
+        pm = QPixmap(path).scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    else:
+        pm = QPixmap(path).scaledToHeight(height, Qt.SmoothTransformation)
+    QPixmapCache.insert(key, pm)
+    return pm
+
+
+# ── Card detail / edit dialog ─────────────────────────────────────────────────
+
+class _CardDetailDialog(QDialog):
+    """Editable detail view for a single collection entry, with sibling navigation."""
+
+    def __init__(
+        self,
+        entry_id: int,
+        col_repo,                        # CollectionRepository
+        cat_entry: dict,                 # catalog data (image, name, set, etc.)
+        p: QWidget | None = None,
+        *,
+        siblings: list | None = None,    # all entry IDs with the same api_id
+        current_idx: int = 0,
+    ) -> None:
+        super().__init__(p)
+        self._col_repo = col_repo
+        self._cat_entry = cat_entry
+        self._siblings: list[int] = siblings if siblings else [entry_id]
+        self._current_idx: int = current_idx
+        self._orig_values: dict = {}
+
+        self.setModal(True)
+        self.resize(480, 760)
+        self.setStyleSheet(
+            "QDialog { background: #1e2030; }"
+            "QLabel  { color: #e2e8f0; }"
+            "QGroupBox { color: #94a3b8; font-size: 11px; border: 1px solid #334155;"
+            "  border-radius: 4px; margin-top: 6px; padding-top: 10px; }"
+            "QGroupBox::title { subcontrol-origin: margin; padding: 0 4px; }"
+            "QComboBox, QSpinBox, QLineEdit, QTextEdit {"
+            "  background: #252741; color: #e2e8f0; border: 1px solid #334155;"
+            "  border-radius: 4px; padding: 4px 8px; }"
+            "QComboBox::drop-down { border: none; }"
+            "QCheckBox { color: #e2e8f0; spacing: 6px; }"
+            "QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #334155;"
+            "  border-radius: 3px; background: #252741; }"
+            "QCheckBox::indicator:checked { background: #5865f2; border-color: #5865f2; }"
+            "QPushButton { border-radius: 5px; padding: 6px 18px; font-size: 12px; }"
+        )
+
+        _nav_btn_ss = (
+            "QPushButton { background: #252741; color: #a5b4fc; border: 1px solid #334155;"
+            " border-radius: 4px; padding: 4px 10px; font-size: 14px; font-weight: bold; }"
+            "QPushButton:hover { background: #4f46e5; color: white; }"
+            "QPushButton:disabled { color: #334155; border-color: #1e2030; background: #1e2030; }"
+        )
+
+        main = QVBoxLayout(self)
+        main.setSpacing(10)
+        main.setContentsMargins(16, 16, 16, 16)
+
+        # ── Header: centered thumbnail, then name/set below ────────────────────
+        img_row = QHBoxLayout()
+        img_row.setContentsMargins(0, 0, 0, 0)
+        self._img_lbl = QLabel()
+        self._img_lbl.setFixedSize(_THUMB_W, _THUMB_H)
+        self._img_lbl.setAlignment(Qt.AlignCenter)
+        self._img_lbl.setStyleSheet(
+            "border: 1px solid #334155; background: #111827; border-radius: 6px;"
+        )
+        img_row.addStretch()
+        img_row.addWidget(self._img_lbl)
+        img_row.addStretch()
+        main.addLayout(img_row)
+
+        self._name_lbl = QLabel()
+        self._name_lbl.setAlignment(Qt.AlignCenter)
+        self._name_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #e2e8f0;")
+        self._name_lbl.setWordWrap(True)
+        main.addWidget(self._name_lbl)
+        self._set_lbl = QLabel()
+        self._set_lbl.setAlignment(Qt.AlignCenter)
+        self._set_lbl.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        main.addWidget(self._set_lbl)
+
+        # ── Navigation row (only shown when multiple siblings) ────────────
+        self._nav_row = QHBoxLayout()
+        self._nav_row.setSpacing(6)
+        self._btn_prev = QPushButton("◀")
+        self._btn_prev.setFixedSize(34, 28)
+        self._btn_prev.setStyleSheet(_nav_btn_ss)
+        self._btn_prev.clicked.connect(lambda: self._navigate(-1))
+        self._nav_lbl = QLabel()
+        self._nav_lbl.setAlignment(Qt.AlignCenter)
+        self._nav_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self._btn_next = QPushButton("▶")
+        self._btn_next.setFixedSize(34, 28)
+        self._btn_next.setStyleSheet(_nav_btn_ss)
+        self._btn_next.clicked.connect(lambda: self._navigate(+1))
+        self._nav_row.addStretch()
+        self._nav_row.addWidget(self._btn_prev)
+        self._nav_row.addWidget(self._nav_lbl)
+        self._nav_row.addWidget(self._btn_next)
+        self._nav_row.addStretch()
+        nav_widget = QWidget()
+        nav_widget.setLayout(self._nav_row)
+        nav_widget.setVisible(len(self._siblings) > 1)
+        self._nav_widget = nav_widget
+        main.addWidget(nav_widget)
+
+        # ── Edit fields ───────────────────────────────────────────────────
+        grp = QGroupBox("Karten-Details")
+        form = QFormLayout(grp)
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self._qty = QSpinBox()
+        self._qty.setRange(1, 999)
+        form.addRow("Anzahl:", self._qty)
+
+        self._cond = QComboBox()
+        for c in ("M", "NM", "LP", "MP", "HP"):
+            self._cond.addItem(c)
+        form.addRow("Qualität:", self._cond)
+
+        self._lang = QComboBox()
+        self._lang_opts = [
+            ("de",      "DE – Deutsch"),
+            ("en",      "EN – Englisch"),
+            ("ja",      "JP – Japanisch"),
+            ("zh-Hant", "CHI – Chinesisch (Trad.)"),
+            ("zh-Hans", "CHI – Chinesisch (Simpl.)"),
+            ("ko",      "KO – Koreanisch"),
+            ("fr",      "FR – Französisch"),
+            ("it",      "IT – Italienisch"),
+            ("es",      "ES – Spanisch"),
+            ("pt",      "PT – Portugiesisch"),
+        ]
+        for code, label in self._lang_opts:
+            self._lang.addItem(label, userData=code)
+        form.addRow("Sprache:", self._lang)
+
+        self._finish = QComboBox()
+        _finish_opts = [
+            ("",           "– Normal –"),
+            ("holo",       "Holo"),
+            ("reverse",    "Reverse Holo"),
+            ("full_art",   "Full Art"),
+            ("alt_art",    "Alt Art"),
+            ("rainbow",    "Rainbow / Hyper Rare"),
+            ("gold",       "Gold"),
+            ("secret",     "Secret Rare"),
+            ("promo",      "Promo"),
+            ("shiny",      "Shiny"),
+            ("etched",     "Etched Holo"),
+        ]
+        self._finish_opts = _finish_opts
+        for code, label in _finish_opts:
+            self._finish.addItem(label, userData=code)
+        form.addRow("Finish:", self._finish)
+
+        self._album = QLineEdit()
+        self._album.setPlaceholderText("z. B. A1, Seite 3 …")
+        form.addRow("Album-Seite:", self._album)
+
+        self._notes = QTextEdit()
+        self._notes.setPlaceholderText("Notizen …")
+        self._notes.setFixedHeight(60)
+        form.addRow("Notizen:", self._notes)
+
+        self._purchase_price = QDoubleSpinBox()
+        self._purchase_price.setRange(0.0, 99999.99)
+        self._purchase_price.setDecimals(2)
+        self._purchase_price.setPrefix("€ ")
+        self._purchase_price.setSingleStep(0.50)
+        self._purchase_price.setSpecialValueText("–")
+        self._purchase_price.setValue(0.0)
+        _pp_row = QHBoxLayout()
+        _pp_row.setSpacing(4)
+        _pp_row.addWidget(self._purchase_price, 1)
+        _pp_clear = QPushButton("×")
+        _pp_clear.setFixedSize(22, 22)
+        _pp_clear.setToolTip("Einkaufspreis löschen")
+        _pp_clear.setStyleSheet(
+            "QPushButton{background:#252741;border:1px solid #334155;border-radius:4px;"
+            "color:#94a3b8;font-size:13px;padding:0;min-width:22px;max-width:22px;"
+            "min-height:22px;max-height:22px;text-align:center;}"
+            "QPushButton:hover{background:#7f1d1d;border-color:#ef4444;color:white;}"
+        )
+        _pp_clear.clicked.connect(lambda: self._purchase_price.setValue(0.0))
+        _pp_row.addWidget(_pp_clear)
+        _pp_widget = QWidget()
+        _pp_widget.setLayout(_pp_row)
+        form.addRow("Einkaufspreis:", _pp_widget)
+
+        main.addWidget(grp)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Abbrechen")
+        btn_cancel.setStyleSheet(
+            "QPushButton { background: #252741; color: #94a3b8; border: 1px solid #334155; }"
+            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
+        )
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("Speichern")
+        btn_save.setStyleSheet(
+            "QPushButton { background: #5865f2; color: white; border: none; font-weight: bold; }"
+            "QPushButton:hover { background: #4752c4; }"
+        )
+        btn_save.setDefault(True)
+        btn_save.clicked.connect(lambda: self._save(close=True))
+        btn_row.addWidget(btn_save)
+        main.addLayout(btn_row)
+
+        # Load initial entry data
+        self._load_entry(entry_id)
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _snapshot(self) -> dict:
+        return {
+            "quantity":       self._qty.value(),
+            "condition":      self._cond.currentText(),
+            "language":       self._lang.currentData() or "",
+            "finish":         self._finish.currentData() or "",
+            "album_page":     self._album.text().strip(),
+            "notes":          self._notes.toPlainText().strip(),
+            "purchase_price": self._purchase_price.value(),
+        }
+
+    def _is_dirty(self) -> bool:
+        return self._snapshot() != self._orig_values
+
+    def _load_entry(self, entry_id: int) -> None:
+        """Populate all form fields from the given entry_id."""
+        self._entry_id = entry_id
+        row = self._col_repo.get_entry(entry_id) or {}
+
+        self.setWindowTitle(
+            f"{row.get('name') or self._cat_entry.get('name') or 'Karte'} bearbeiten"
+        )
+        self._name_lbl.setText(
+            row.get("name") or self._cat_entry.get("name") or "–"
+        )
+        self._set_lbl.setText(
+            f"{row.get('set_name') or '–'}  ·  #{row.get('card_number') or '–'}"
+        )
+
+        self._qty.setValue(int(row.get("quantity") or 1))
+
+        cond_idx = self._cond.findText((row.get("condition") or "NM").upper())
+        if cond_idx >= 0:
+            self._cond.setCurrentIndex(cond_idx)
+
+        lang_code = row.get("language") or ""
+        li = next(
+            (i for i, (c, _) in enumerate(self._lang_opts) if c == lang_code), -1
+        )
+        if li >= 0:
+            self._lang.setCurrentIndex(li)
+
+        finish = row.get("finish") or (
+            "holo" if row.get("is_foil") else ""
+        )
+        fi = next(
+            (i for i, (c, _) in enumerate(self._finish_opts) if c == finish), 0
+        )
+        self._finish.setCurrentIndex(fi)
+        self._album.setText(row.get("album_page") or "")
+        self._notes.setPlainText(row.get("notes") or "")
+        self._purchase_price.setValue(float(row.get("purchase_price") or 0.0))
+
+        # Nav counter
+        n = len(self._siblings)
+        self._nav_lbl.setText(f"Eintrag {self._current_idx + 1} / {n}")
+        self._btn_prev.setEnabled(self._current_idx > 0)
+        self._btn_next.setEnabled(self._current_idx < n - 1)
+
+        # Update image label (cat_entry carries the correct local_image_path)
+        local = resolve_card_image(api_id=self._cat_entry.get("api_id"), stored_hint=self._cat_entry.get("local_image_path"))
+        if local:
+            px = QPixmap(local).scaled(_THUMB_W, _THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self._img_lbl.setPixmap(px)
+            self._img_lbl.setStyleSheet(
+                "border: 1px solid #334155; background: #111827; border-radius: 6px;"
             )
         else:
-            _px_cache[key] = QPixmap(path).scaledToHeight(height, Qt.SmoothTransformation)
-    return _px_cache[key]
+            self._img_lbl.clear()
+            self._img_lbl.setText("?")
+            self._img_lbl.setStyleSheet(
+                "border: 1px solid #334155; background: #111827; border-radius: 6px;"
+                " color:#888; font-size:32px;"
+            )
+
+        # Snapshot original values for dirty-check
+        self._orig_values = self._snapshot()
+
+    def _navigate(self, delta: int) -> None:
+        if self._is_dirty():
+            reply = QMessageBox.question(
+                self,
+                "Ungespeicherte Änderungen",
+                "Es gibt ungespeicherte Änderungen.\nJetzt speichern?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Save:
+                self._save(close=False)
+        self._current_idx += delta
+        self._load_entry(self._siblings[self._current_idx])
+
+    def _save(self, *, close: bool = True) -> None:
+        pp = self._purchase_price.value()
+        self._col_repo.update_entry(
+            self._entry_id,
+            quantity=self._qty.value(),
+            language=self._lang.currentData() or "",
+            condition=self._cond.currentText(),
+            finish=self._finish.currentData() or "",
+            notes=self._notes.toPlainText().strip(),
+            album_page=self._album.text().strip(),
+            purchase_price=pp if pp > 0.0 else None,
+        )
+        self._orig_values = self._snapshot()  # reset dirty state
+        if close:
+            self.accept()
 
 
 class _CardTile(QFrame):
-    remove_requested = Signal(int)  # entry id
+    remove_requested = Signal(int)   # entry id
+    detail_requested = Signal(int)   # entry id (owned cards only)
 
     def __init__(self, entry: dict, owned_row: dict | None, p: QWidget | None = None) -> None:
         super().__init__(p)
+        self._entry = entry
+        self._owned_row = owned_row
+        self._selected = False
         self.setFixedWidth(_CARD_W)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.setFrameShape(QFrame.StyledPanel)
-        bg = "#eafaea" if owned_row else "#f9f9f9"
-        bd = "#2a9a2a" if owned_row else "#cccccc"
+        bg = "#162820" if owned_row else "#1e2030"
+        bd = "#2a5a2a" if owned_row else "#2a3045"
         # All child QLabels get transparent background via descendant rule
         self.setStyleSheet(
             f"QFrame#tile {{ background:{bg}; border:2px solid {bd}; border-radius:6px; }}"
@@ -102,7 +411,7 @@ class _CardTile(QFrame):
         img_lbl.setStyleSheet(
             "border:1px solid #aaaaaa; background:#1a1a2e; border-radius:3px;"
         )
-        local = _resolve_image_path(entry.get("local_image_path"))
+        local = resolve_card_image(api_id=entry.get("api_id"), stored_hint=entry.get("local_image_path"))
         if local:
             cache_key = f"{local}:{_THUMB_W}x{_THUMB_H}"
             cached = QPixmapCache.find(cache_key)
@@ -145,9 +454,29 @@ class _CardTile(QFrame):
                 rm_btn.setEnabled(False)
             rm_btn.raise_()
 
+        # Selection checkmark overlay (bottom-right of thumbnail, shown when selected)
+        self._check_overlay = QLabel("✔", thumb_container)
+        self._check_overlay.setFixedSize(28, 28)
+        self._check_overlay.setAlignment(Qt.AlignCenter)
+        self._check_overlay.setStyleSheet(
+            "background:#16a34a;color:white;font-size:14px;font-weight:bold;"
+            "border-radius:14px;border:none;"
+        )
+        self._check_overlay.move(_THUMB_W - 30, _THUMB_H - 30)
+        self._check_overlay.setVisible(False)
+        self._check_overlay.raise_()
+
         vbox.addWidget(thumb_container, 0, Qt.AlignHCenter)
 
-        vbox.addWidget(_lbl(entry.get("name", ""), "font-weight:bold; font-size:11px;"))
+        en_name = entry.get("name", "")
+        vbox.addWidget(_lbl(en_name, "font-weight:bold; font-size:11px;"))
+
+        # Show German name below the English name (if known)
+        from src.pokemon_scanner.core.name_translations import translate_to_de as _t2de
+        _de_name = _t2de(en_name)
+        if _de_name:
+            vbox.addWidget(_lbl(_de_name.capitalize(),
+                                "font-size:9px; color:#1e40af; font-style:italic;"))
 
         sn = f"{entry.get('set_name') or ''}  #{entry.get('card_number') or ''}".strip()
         vbox.addWidget(_lbl(sn, "font-size:9px; color:#64748b;"))
@@ -197,6 +526,22 @@ class _CardTile(QFrame):
             )
             vbox.addWidget(cond_lbl)
 
+            # Bearbeiten button (only for owned cards with a DB id)
+            _eid = owned_row.get("id")
+            if _eid:
+                _detail_btn = QPushButton("✏ Bearbeiten")
+                _detail_btn.setFixedHeight(22)
+                _detail_btn.setStyleSheet(
+                    "QPushButton{background:#252741;color:#a5b4fc;font-size:9px;"
+                    "font-weight:bold;border-radius:4px;border:1px solid #4f46e5;"
+                    "padding:0 6px;}"
+                    "QPushButton:hover{background:#4f46e5;color:white;}"
+                )
+                _detail_btn.clicked.connect(
+                    lambda _checked, eid=_eid: self.detail_requested.emit(eid)
+                )
+                vbox.addWidget(_detail_btn)
+
         price = entry.get("best_price")
         cur2 = entry.get("price_currency") or "USD"
         prefix = "Heute: " if owned_row else ""
@@ -210,6 +555,8 @@ class _CardTile(QFrame):
 
         # Rich hover tooltip with extended card metadata
         _tt: list[str] = []
+        if _de_name:
+            _tt.append(f"<b>DE-Name:</b> {_de_name.capitalize()}")
         _st = entry.get("supertype", "")
         _sub = entry.get("subtypes", "")
         if _st:
@@ -235,6 +582,77 @@ class _CardTile(QFrame):
         if _tt:
             self.setToolTip("<br>".join(_tt))
 
+        # ── TCGPlayer buy-link button (only if URL present) ──────────────────
+        tcg_url = entry.get("tcgplayer_url") or ""
+        if tcg_url:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            tcg_btn = QPushButton("TCGPlayer kaufen")
+            tcg_btn.setFixedHeight(22)
+            tcg_btn.setStyleSheet(
+                "QPushButton{background:#1a1a2e;color:#f7c948;font-size:9px;font-weight:bold;"
+                "border-radius:4px;border:none;padding:0 6px;}"
+                "QPushButton:hover{background:#e6b800;color:#1a1a2e;}"
+            )
+            tcg_btn.clicked.connect(lambda _checked, u=tcg_url: QDesktopServices.openUrl(QUrl(u)))
+            vbox.addWidget(tcg_btn)
+
+        # ── Selection row (qty spinbox + add/toggle button) ──────────────────
+        sel_row = QHBoxLayout()
+        sel_row.setContentsMargins(0, 2, 2, 0)
+        sel_row.setSpacing(4)
+        self._qty_spin = QSpinBox()
+        self._qty_spin.setRange(1, 99)
+        self._qty_spin.setValue(1)
+        self._qty_spin.setFixedSize(56, 24)
+        self._qty_spin.setVisible(False)
+        self._qty_spin.setStyleSheet("font-size:10px;")
+        sel_row.addWidget(self._qty_spin)
+        sel_row.addStretch()
+        self._add_btn = QPushButton("+")
+        self._add_btn.setFixedSize(28, 28)
+        self._add_btn.setStyleSheet(
+            "QPushButton{background:#3a7ecf;color:white;font-size:18px;font-weight:bold;"
+            "border-radius:14px;border:none;padding:0;}"
+            "QPushButton:hover{background:#2563eb;}"
+        )
+        self._add_btn.clicked.connect(self._toggle_select)
+        sel_row.addWidget(self._add_btn)
+        vbox.addLayout(sel_row)
+
+    def _toggle_select(self) -> None:
+        self._selected = not self._selected
+        self._check_overlay.setVisible(self._selected)
+        self._qty_spin.setVisible(self._selected)
+        if self._selected:
+            self.setStyleSheet(
+                "QFrame#tile{background:#1a2540;border:2px solid #2563eb;border-radius:6px;}"
+                "QFrame#tile QLabel{border:none;background:transparent;}"
+            )
+            self._add_btn.setStyleSheet(
+                "QPushButton{background:#16a34a;color:white;font-size:18px;font-weight:bold;"
+                "border-radius:14px;border:none;padding:0;}"
+                "QPushButton:hover{background:#15803d;}"
+            )
+        else:
+            bg = "#162820" if self._owned_row else "#1e2030"
+            bd = "#2a5a2a" if self._owned_row else "#2a3045"
+            self.setStyleSheet(
+                f"QFrame#tile{{background:{bg};border:2px solid {bd};border-radius:6px;}}"
+                "QFrame#tile QLabel{border:none;background:transparent;}"
+            )
+            self._add_btn.setStyleSheet(
+                "QPushButton{background:#3a7ecf;color:white;font-size:18px;font-weight:bold;"
+                "border-radius:14px;border:none;padding:0;}"
+                "QPushButton:hover{background:#2563eb;}"
+            )
+
+    def get_selection(self) -> tuple[dict, int] | None:
+        """Return (entry, quantity) if this tile is selected, else None."""
+        if not self._selected:
+            return None
+        return (self._entry, self._qty_spin.value())
+
 
 # ── Year-grouped set tiles ────────────────────────────────────────────────────
 _SET_TILE_W = 316
@@ -256,11 +674,11 @@ class _SetHeaderTile(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("settile")
         self._base_ss = (
-            "QFrame#settile{background:#f0f4f8;border:2px solid #c0ccdd;border-radius:5px;}"
+            "QFrame#settile{background:#1e2030;border:2px solid #2a3045;border-radius:5px;}"
             "QFrame#settile QLabel{border:none;background:transparent;}"
         )
         self._active_ss = (
-            "QFrame#settile{background:#ddeeff;border:2px solid #3a7ecf;border-radius:5px;}"
+            "QFrame#settile{background:#1a2540;border:2px solid #3a7ecf;border-radius:5px;}"
             "QFrame#settile QLabel{border:none;background:transparent;}"
         )
         self.setStyleSheet(self._base_ss)
@@ -323,7 +741,7 @@ class _SetHeaderTile(QFrame):
         prog.setFixedHeight(10)
         prog.setTextVisible(False)
         prog.setStyleSheet(
-            "QProgressBar{border:1px solid #c0ccdd;border-radius:4px;background:#e8edf4;}"
+            "QProgressBar{border:1px solid #2a3045;border-radius:4px;background:#16192b;}"
             "QProgressBar::chunk{background:#2a9a2a;border-radius:3px;}"
         )
         lay.addWidget(prog)
@@ -459,6 +877,7 @@ class _SetTileFlow(QWidget):
 class _YearSection(QWidget):
     """Collapsible year section: set tiles in a grid, click opens that set's cards."""
     remove_requested = Signal(int)
+    detail_requested = Signal(int)  # entry id
 
     def __init__(
         self,
@@ -581,12 +1000,19 @@ class _YearSection(QWidget):
                 tile = _CardTile(entry, owned_row)
                 if owned_row:
                     tile.remove_requested.connect(self.remove_requested)
+                    tile.detail_requested.connect(self.detail_requested)
                 tiles.append(tile)
             self._card_grids[set_name] = _FlowGrid(tiles)
         lay.addWidget(self._card_grids[set_name])
 
     def tiles_by_name(self) -> dict[str, "_SetHeaderTile"]:
         return dict(self._tile_flow._by_name)
+
+    def get_selected_tiles(self) -> list["_CardTile"]:
+        result: list[_CardTile] = []
+        for grid in self._card_grids.values():
+            result.extend(t for t in grid._tiles if isinstance(t, _CardTile) and t._selected)
+        return result
 
 
 class _SetDivider(QWidget):
@@ -761,6 +1187,11 @@ class _CollapsibleSet(QWidget):
         self._flow = _FlowGrid(tiles)
         self._content_layout.addWidget(self._flow)
 
+    def get_selected_tiles(self) -> list["_CardTile"]:
+        if self._flow is None:
+            return []
+        return [t for t in self._flow._tiles if isinstance(t, _CardTile) and t._selected]
+
 
 def _logo_path_for_set(set_name: str, db_path: str | None = None) -> str | None:
     """Return the local logo path for a set, checking DB value first, then reconstructed path."""
@@ -858,20 +1289,7 @@ class _SetLogoDownloadWorker(QThread):
         self.done.emit()
 
 
-def _resolve_image(col: dict, cat: dict) -> str | None:
-    """Return the best available local card-art path for a collection row."""
-    # 1. Catalog DB already has the path
-    p = cat.get("local_image_path")
-    if p and Path(p).exists():
-        return p
-    # 2. Reconstruct from api_id (catalog saves as catalog_images/{safe_id}.jpg)
-    api_id = col.get("api_id") or cat.get("api_id") or ""
-    if api_id:
-        safe = api_id.replace("/", "_").replace("\\", "_")
-        candidate = CATALOG_IMAGES_DIR / f"{safe}.jpg"
-        if candidate.exists():
-            return str(candidate)
-    return None
+
 
 
 class _SealedPriceWorker(QThread):
@@ -1284,7 +1702,7 @@ class _SammlungDataWorker(QThread):
                     "language": col.get("language") or cat.get("language") or "",
                     "best_price": cat.get("best_price"),
                     "price_currency": cat.get("price_currency") or "USD",
-                    "local_image_path": _resolve_image(col, cat),
+                    "local_image_path": resolve_card_image(api_id=col.get("api_id") or cat.get("api_id"), stored_hint=cat.get("local_image_path")),
                     "updated_at": cat.get("updated_at") or "",
                     "fetched_at": cat.get("fetched_at") or "",
                     "set_release_date": cat.get("set_release_date") or "",
@@ -1400,8 +1818,8 @@ class _PriceHistoryChart(QWidget):
             return PT + ch - (price - min_p) / p_range * ch
 
         # Background + border
-        painter.fillRect(PL, PT, cw, ch, QColor("#f8fafc"))
-        painter.setPen(QPen(QColor("#dde4ee"), 1))
+        painter.fillRect(PL, PT, cw, ch, QColor("#1a1d2e"))
+        painter.setPen(QPen(QColor("#2a3045"), 1))
         painter.drawRect(PL, PT, cw, ch)
 
         # Horizontal grid lines + Y labels
@@ -1411,10 +1829,10 @@ class _PriceHistoryChart(QWidget):
         for step in range(4):
             frac = step / 3
             y = int(PT + frac * ch)
-            painter.setPen(QPen(QColor("#e0e8f0"), 1))
+            painter.setPen(QPen(QColor("#252741"), 1))
             painter.drawLine(PL + 1, y, PL + cw - 1, y)
             price_at = max_p - frac * p_range
-            painter.setPen(QColor("#888888"))
+            painter.setPen(QColor("#94a3b8"))
             painter.drawText(
                 0, y - 7, PL - 4, 14,
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -1445,7 +1863,7 @@ class _PriceHistoryChart(QWidget):
                     lbl = d.strftime("%d.%m.%y")
                 except Exception:
                     lbl = dates[i][-8:] if len(dates[i]) >= 8 else dates[i]
-                painter.setPen(QColor("#555555"))
+                painter.setPen(QColor("#94a3b8"))
                 painter.drawText(
                     int(x - 22), self._H - PB + 3, 44, 16,
                     Qt.AlignCenter, lbl,
@@ -1706,7 +2124,7 @@ class _TopPerformerWorker(QThread):
 class _TopRow(QFrame):
     """Single clickable row in the Top-Performer table."""
     selected = Signal(dict)
-    _H = 52
+    _H = 88
 
     def __init__(
         self, rank: int, entry: dict, owned: bool, p: QWidget | None = None
@@ -1715,10 +2133,10 @@ class _TopRow(QFrame):
         self._entry = entry
         self.setFixedHeight(self._H)
         self.setCursor(Qt.PointingHandCursor)
-        bg = "#edfaed" if owned else ("#f7f9fc" if rank % 2 == 0 else "#ffffff")
+        bg = "#162820" if owned else ("#16192b" if rank % 2 == 0 else "#1e2030")
         self.setObjectName("toprow")
         self.setStyleSheet(
-            f"background:{bg};border:none;border-bottom:1px solid #e0e8f0;"
+            f"background:{bg};border:none;border-bottom:1px solid #2a3045;"
         )
         hl = QHBoxLayout(self)
         hl.setContentsMargins(6, 2, 6, 2)
@@ -1737,14 +2155,14 @@ class _TopRow(QFrame):
 
         # Thumbnail
         img_lbl = QLabel()
-        img_lbl.setFixedSize(30, 42)
+        img_lbl.setFixedSize(56, 78)
         img_lbl.setAlignment(Qt.AlignCenter)
         img_lbl.setStyleSheet(
-            "border:1px solid #ccc;border-radius:2px;background:#f0f0f0;"
+            "border:1px solid #2a3045;border-radius:2px;background:#1a1d2e;"
         )
-        p_path = _resolve_image_path(entry.get("local_image_path"))
+        p_path = resolve_card_image(api_id=entry.get("api_id"), stored_hint=entry.get("local_image_path"))
         if p_path:
-            px = _cached_pixmap(p_path, 42, 30)
+            px = _cached_pixmap(p_path, 78, 56)
             if not px.isNull():
                 img_lbl.setPixmap(px)
         hl.addWidget(img_lbl)
@@ -1757,13 +2175,13 @@ class _TopRow(QFrame):
         ncl.setSpacing(1)
         nm = QLabel(entry.get("name") or "\u2013")
         nm.setStyleSheet(
-            "font-weight:bold;font-size:11px;border:none;background:transparent;"
+            "font-weight:bold;font-size:11px;color:#e2e8f0;border:none;background:transparent;"
         )
         nm.setWordWrap(False)
         ncl.addWidget(nm)
         num_lbl = QLabel(f"#{entry.get('card_number') or '?'}")
         num_lbl.setStyleSheet(
-            "font-size:9px;color:#777;border:none;background:transparent;"
+            "font-size:9px;color:#94a3b8;border:none;background:transparent;"
         )
         ncl.addWidget(num_lbl)
         hl.addWidget(name_col, 1)
@@ -1772,7 +2190,7 @@ class _TopRow(QFrame):
         set_lbl = QLabel(entry.get("set_name") or "\u2013")
         set_lbl.setFixedWidth(150)
         set_lbl.setStyleSheet(
-            "font-size:10px;color:#555;border:none;background:transparent;"
+            "font-size:10px;color:#94a3b8;border:none;background:transparent;"
         )
         set_lbl.setWordWrap(False)
         hl.addWidget(set_lbl)
@@ -1783,7 +2201,7 @@ class _TopRow(QFrame):
         yr_lbl.setFixedWidth(40)
         yr_lbl.setAlignment(Qt.AlignCenter)
         yr_lbl.setStyleSheet(
-            "font-size:10px;color:#555;border:none;background:transparent;"
+            "font-size:10px;color:#94a3b8;border:none;background:transparent;"
         )
         hl.addWidget(yr_lbl)
 
@@ -1824,11 +2242,11 @@ class _TopRow(QFrame):
         if score and age_years and age_years > 0:
             per_yr_txt = f"+{sym}{score:.1f}/a"
             if score >= 15:
-                sc_color = "#186a18"; sc_bg = "#d4f5d4"
+                sc_color = "#4ade80"; sc_bg = "#162820"
             elif score >= 4:
-                sc_color = "#7a4a00"; sc_bg = "#fff0cc"
+                sc_color = "#fbbf24"; sc_bg = "#2a1a00"
             else:
-                sc_color = "#555"; sc_bg = "#eeeeee"
+                sc_color = "#94a3b8"; sc_bg = "#252741"
             sc_tip = (
                 f"Gesch\u00e4tzter Wertzuwachs \u00f8 {sym}{score:.1f} pro Jahr\n"
                 f"Berechnung: Aktueller Preis ({sym}{price:.2f}) \u00f7 "
@@ -1837,7 +2255,7 @@ class _TopRow(QFrame):
             )
         else:
             per_yr_txt = "\u2013"
-            sc_color = "#aaa"; sc_bg = "#f5f5f5"
+            sc_color = "#64748b"; sc_bg = "#1e2030"
             sc_tip = "Kein Release-Datum vorhanden."
         sc_lbl = QLabel(per_yr_txt)
         sc_lbl.setFixedWidth(80)
@@ -1891,8 +2309,8 @@ class _TopPerformerWidget(QWidget):
         # Filter bar
         fb = QFrame()
         fb.setStyleSheet(
-            "QFrame{background:#f0f4f8;border:1px solid #d0d8e0;border-radius:6px;}"
-            "QFrame QLabel{border:none;background:transparent;color:#444;}"
+            "QFrame{background:#1e2030;border:1px solid #2a3045;border-radius:6px;}"
+            "QFrame QLabel{border:none;background:transparent;color:#e2e8f0;}"
         )
         fb.setFixedHeight(44)
         fl = QHBoxLayout(fb)
@@ -1929,9 +2347,9 @@ class _TopPerformerWidget(QWidget):
         # Disclaimer bar
         disc = QFrame()
         disc.setStyleSheet(
-            "QFrame{background:#fffbe6;border:1px solid #f0d060;"
+            "QFrame{background:#1a1a0e;border:1px solid #5a4800;"
             "border-radius:5px;padding:0px;}"
-            "QFrame QLabel{border:none;background:transparent;color:#7a5c00;"
+            "QFrame QLabel{border:none;background:transparent;color:#c8a000;"
             "font-size:10px;}"
         )
         disc.setFixedHeight(26)
@@ -1959,7 +2377,7 @@ class _TopPerformerWidget(QWidget):
         hl.setContentsMargins(6, 0, 6, 0)
         hl.setSpacing(6)
         for txt, w in [
-            ("Rang", 36), ("Bild", 30), ("Name / Nr.", 0),
+            ("Rang", 36), ("Bild", 56), ("Name / Nr.", 0),
             ("Set", 150), ("Jahr", 40), ("Lang", 34), ("Preis", 75),
             ("\u00d8/Jahr\u2191", 80), ("\u2714", 20),
         ]:
@@ -2146,7 +2564,7 @@ class _TopPerformerWidget(QWidget):
         dlg.exec()
 
 
-class CatalogDialog(QDialog):
+class CatalogWidget(QWidget):
     def __init__(
         self,
         catalog_repo: CatalogRepository,
@@ -2155,16 +2573,16 @@ class CatalogDialog(QDialog):
         settings=None,
     ) -> None:
         super().__init__(p)
-        self.setWindowTitle("Katalog & Sammlung")
-        self.resize(1200, 750)
         self._repo = catalog_repo
         self._col_repo = collection_repo
         self._settings = settings
         # Increase pixmap cache to 50 MB (default is 10 MB)
         QPixmapCache.setCacheLimit(51_200)
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
         self._tabs = QTabWidget()
+        self._tabs.tabBar().setVisible(False)  # sidebar handles navigation
         layout.addWidget(self._tabs, 1)
 
         kat_root = QWidget()
@@ -2225,20 +2643,55 @@ class CatalogDialog(QDialog):
         self._scroll.setWidgetResizable(True)
         self._grid_widget: QWidget | None = None
         kat_layout.addWidget(self._scroll, 1)
+        # ── Katalog selection action bar ──────────────────────────────────────
+        _sel_bar = QWidget()
+        _sel_bar.setFixedHeight(44)
+        _sbl = QHBoxLayout(_sel_bar)
+        _sbl.setContentsMargins(8, 4, 8, 4)
+        _sbl.addStretch()
+        self._adopt_btn = QPushButton("\u2714  Auswahl in Sammlung \u00fcbernehmen")
+        self._adopt_btn.setMinimumHeight(32)
+        self._adopt_btn.setStyleSheet(
+            "QPushButton{background:#16a34a;color:white;font-size:11px;"
+            "font-weight:bold;border-radius:5px;padding:0 12px;}"
+            "QPushButton:hover{background:#15803d;}"
+        )
+        self._adopt_btn.clicked.connect(self._adopt_selection)
+        _sbl.addWidget(self._adopt_btn)
+        kat_layout.addWidget(_sel_bar)
         self._tiles: list[_CardTile] = []
+        self._kat_sections: list = []
         self._tile_by_setname: dict[str, _SetHeaderTile] = {}
         self._sealed_price_worker: _SealedPriceWorker | None = None
         self._tabs.addTab(kat_root, "\U0001f4d6  Katalog")
 
+        # ── Sammlung tab (with inner subtabs: Karten + Alben) ────────────────
         samm_root = QWidget()
-        samm_layout = QVBoxLayout(samm_root)
+        samm_outer_layout = QVBoxLayout(samm_root)
+        samm_outer_layout.setContentsMargins(0, 0, 0, 0)
+        samm_outer_layout.setSpacing(0)
+
+        # Inner tab widget for Karten vs Alben
+        self._samm_inner_tabs = QTabWidget()
+        self._samm_inner_tabs.setStyleSheet(
+            "QTabWidget::pane{border:none;background:#1e2030;}"
+            "QTabBar::tab{background:#1a1d2e;color:#94a3b8;padding:6px 16px;"
+            "border:1px solid #2a3045;border-bottom:none;border-radius:4px 4px 0 0;margin-right:2px;}"
+            "QTabBar::tab:selected{background:#1e2030;color:#e2e8f0;border-bottom:1px solid #1e2030;}"
+            "QTabBar::tab:hover:!selected{background:#252741;color:#e2e8f0;}"
+        )
+        samm_outer_layout.addWidget(self._samm_inner_tabs, 1)
+
+        # ── Karten subtab ───────────────────────────────────────────────────
+        karten_widget = QWidget()
+        samm_layout = QVBoxLayout(karten_widget)
         samm_layout.setContentsMargins(4, 4, 4, 4)
         samm_layout.setSpacing(4)
 
         # ── Stats bar ───────────────────────────────────────────────────────
         stats_bar = QFrame()
         stats_bar.setStyleSheet(
-            "QFrame { background: #f0f4f8; border: 1px solid #d0d8e0;"
+            "QFrame { background: #252741; border: 1px solid #334155;"
             " border-radius: 6px; }"
         )
         stats_bar.setFixedHeight(48)
@@ -2246,13 +2699,13 @@ class CatalogDialog(QDialog):
         sb_lay.setContentsMargins(14, 0, 10, 0)
         sb_lay.setSpacing(20)
         self._samm_count_label = QLabel("\U0001f4c4 – Karten")
-        self._samm_count_label.setStyleSheet("color: #444; border: none; background: transparent;")
+        self._samm_count_label.setStyleSheet("color: #e2e8f0; border: none; background: transparent;")
         self._stats_cost = QLabel("Kosten: –")
-        self._stats_cost.setStyleSheet("color: #555; border: none; background: transparent;")
+        self._stats_cost.setStyleSheet("color: #94a3b8; border: none; background: transparent;")
         self._stats_value = QLabel("Wert: –")
-        self._stats_value.setStyleSheet("color: #555; border: none; background: transparent;")
+        self._stats_value.setStyleSheet("color: #94a3b8; border: none; background: transparent;")
         self._stats_guv = QLabel("GuV: –")
-        self._stats_guv.setStyleSheet("color: #888; border: none; background: transparent;")
+        self._stats_guv.setStyleSheet("color: #94a3b8; border: none; background: transparent;")
         self._refresh_btn = QPushButton("\u21bb  Refresh")
         self._refresh_btn.setMinimumHeight(32)
         self._refresh_btn.setFixedWidth(120)
@@ -2291,6 +2744,16 @@ class CatalogDialog(QDialog):
         self._logo_worker: _SetLogoDownloadWorker | None = None
         self._backfill_attempted_ids: set[int] = set()
         samm_layout.addWidget(self._samm_scroll, 1)
+
+        self._samm_inner_tabs.addTab(karten_widget, "\U0001f4c4  Karten")
+
+        # ── Alben subtab ────────────────────────────────────────────────────
+        _album_repo = AlbumRepository(collection_repo.database)
+        self._alben_widget = AlbenWidget(_album_repo, collection_repo)
+        self._samm_inner_tabs.addTab(self._alben_widget, "\U0001f4d2  Alben")
+
+        self._samm_inner_tabs.currentChanged.connect(self._on_samm_inner_tab_changed)
+
         self._tabs.addTab(samm_root, "\u2b50  Sammlung")
 
         # ── Top-Performer tab ────────────────────────────────────────────────
@@ -2314,14 +2777,21 @@ class CatalogDialog(QDialog):
         # ── Status bar (bottom) ──────────────────────────────────────────────
         self._status_label = QLabel("Bereit.")
         self._status_label.setStyleSheet(
-            "color: #555; font-size: 10px; padding: 2px 6px;"
-            " border-top: 1px solid #ddd; background: #fafafa;"
+            "color: #94a3b8; font-size: 10px; padding: 2px 6px;"
+            " border-top: 1px solid #334155;"
         )
         self._status_label.setFixedHeight(22)
         layout.addWidget(self._status_label)
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
-        """Stop all background workers before the dialog is destroyed."""
+    # ── Public API for embedded use ───────────────────────────────────────────
+
+    def show_page(self, idx: int) -> None:
+        """Switch to the given tab (0=Katalog, 1=Sammlung, 2=Top-Performer)."""
+        self._tabs.setCurrentIndex(idx)
+        self._on_tab_changed(idx)
+
+    def stop_workers(self) -> None:
+        """Gracefully stop all background workers (call before app exit)."""
         workers = [
             self._logo_worker,
             self._set_release_worker,
@@ -2339,8 +2809,10 @@ class CatalogDialog(QDialog):
             if w is not None and w.isRunning():
                 w.quit()
                 w.wait(2000)
-        # Also stop workers inside the Top-Performer tab
         self._top_widget.stop_workers()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.stop_workers()
         super().closeEvent(event)
 
     def _owned_map(self) -> dict:
@@ -2372,7 +2844,6 @@ class CatalogDialog(QDialog):
         warn.setTextFormat(Qt.RichText)
         warn.setStyleSheet("font-size:10px; color:#b45309; background:#fef3c7; padding:4px; border-radius:4px;")
         lay.addWidget(warn)
-        from PySide6.QtWidgets import QFormLayout
         form = QFormLayout()
         pub_edit = QLineEdit(settings.tcgplayer_public_key or "")
         pub_edit.setPlaceholderText("Public Key")
@@ -2475,6 +2946,7 @@ class CatalogDialog(QDialog):
 
         self._count_label.setText(f"{len(unique)} Karten")
         is_search = bool(query)
+        self._kat_sections = []
 
         if not unique:
             from PySide6.QtCore import Qt
@@ -2502,7 +2974,10 @@ class CatalogDialog(QDialog):
                 logo_path = _logo_path_for_set(set_name, db_logo)
                 section = _CollapsibleSet(set_name or "(Unbekanntes Set)", logo_path, group, owned)
                 section.remove_requested.connect(self._on_remove_card)
+                if hasattr(section, 'detail_requested'):
+                    section.detail_requested.connect(self._open_card_detail)
                 section.expand_for_search()
+                self._kat_sections.append(section)
                 vbox.addWidget(section)
         else:
             self._tile_by_setname.clear()
@@ -2528,7 +3003,9 @@ class CatalogDialog(QDialog):
                     ))
                 section = _YearSection(year, sets_info, owned)
                 section.remove_requested.connect(self._on_remove_card)
+                section.detail_requested.connect(self._open_card_detail)
                 self._tile_by_setname.update(section.tiles_by_name())
+                self._kat_sections.append(section)
                 vbox.addWidget(section)
 
             # Apply cached sealed prices from DB immediately
@@ -2607,6 +3084,7 @@ class CatalogDialog(QDialog):
             ]
             section = _YearSection(year, sets_info, owned_lookup)
             section.remove_requested.connect(self._on_remove_card)
+            section.detail_requested.connect(self._open_card_detail)
             vbox.addWidget(section)
 
         vbox.addStretch(1)
@@ -2634,7 +3112,7 @@ class CatalogDialog(QDialog):
             for api_id, cat in cat_by_api.items()
             if api_id in col_api_ids
             and cat.get("image_url")
-            and not _resolve_image({"api_id": api_id}, cat)
+            and not resolve_card_image(api_id=api_id, stored_hint=cat.get("local_image_path"))
         ]
         if jobs:
             self._set_status(f"Lade {len(jobs)} fehlende Bild(er) …")
@@ -2654,6 +3132,123 @@ class CatalogDialog(QDialog):
         )
         if reply == QMessageBox.Yes:
             self._col_repo.delete_entry(entry_id)
+            self._load_sammlung(_fetch_images=False)
+
+    def _open_card_detail(self, entry_id: int) -> None:
+        """Open the edit dialog for a single collection entry."""
+        row = self._col_repo.get_entry(entry_id) or {}
+        api_id: str = row.get("api_id") or ""
+        cat_entry: dict = {}
+        if api_id:
+            # Prefer a direct api_id lookup (avoids broken text-search call)
+            try:
+                result = self._repo.get_by_api_id(api_id)
+                if result:
+                    cat_entry = result
+            except Exception:
+                pass
+        # Fallback: use the scan image stored on the collection entry
+        if not cat_entry.get("local_image_path") and row.get("image_path"):
+            cat_entry["local_image_path"] = row["image_path"]
+
+        # Build siblings list (all entries sharing the same api_id).
+        # If this entry has quantity > 1 and is the only DB row, auto-split first.
+        siblings: list[int] = [entry_id]
+        current_idx: int = 0
+        if api_id:
+            try:
+                sibling_rows = self._col_repo.get_entries_by_api_id(api_id)
+                if len(sibling_rows) == 1:
+                    qty = int((sibling_rows[0].get("quantity") or 1))
+                    if qty > 1:
+                        siblings = self._col_repo.split_entry(entry_id)
+                    else:
+                        siblings = [entry_id]
+                else:
+                    siblings = [r["id"] for r in sibling_rows]
+                current_idx = next(
+                    (i for i, sid in enumerate(siblings) if sid == entry_id), 0
+                )
+            except Exception:
+                pass
+
+        dlg = _CardDetailDialog(
+            entry_id, self._col_repo, cat_entry, self,
+            siblings=siblings, current_idx=current_idx,
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self._load_sammlung(_fetch_images=False)
+
+    def _adopt_selection(self) -> None:
+        """Bulk-add all selected catalog tiles to the collection."""
+        import datetime as _dt
+        selected: list[tuple[dict, int]] = []
+        for section in self._kat_sections:
+            for tile in section.get_selected_tiles():
+                sel = tile.get_selection()
+                if sel is not None:
+                    selected.append(sel)
+        if not selected:
+            QMessageBox.information(self, "Keine Auswahl", "Keine Karten ausgew\u00e4hlt.")
+            return
+
+        owned = self._col_repo.get_owned_lookup()
+        added = 0
+        skipped = 0
+        for entry, qty in selected:
+            api_id = entry.get("api_id") or ""
+            existing = owned.get(api_id) if api_id else None
+            if existing:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Karte bereits vorhanden")
+                msg.setText(
+                    f"\"{entry.get('name')}\" ist bereits in der Sammlung "
+                    f"(Anzahl: {existing.get('quantity', 1)})."
+                )
+                msg.setInformativeText("Was m\u00f6chtest du tun?")
+                btn_overwrite = msg.addButton("\u00dcberschreiben", QMessageBox.AcceptRole)
+                msg.addButton("\u00dcberspringen", QMessageBox.RejectRole)
+                btn_cancel = msg.addButton("Abbrechen", QMessageBox.DestructiveRole)
+                msg.setDefaultButton(msg.button(QMessageBox.RejectRole) or btn_cancel)
+                msg.exec()
+                clicked = msg.clickedButton()
+                if clicked is btn_cancel:
+                    break
+                elif clicked is btn_overwrite:
+                    self._col_repo.set_quantity(existing["id"], qty)
+                    added += 1
+                else:
+                    skipped += 1
+            else:
+                self._col_repo.upsert_by_identity(
+                    api_id=api_id,
+                    name=entry.get("name") or "",
+                    set_name=entry.get("set_name") or "",
+                    card_number=entry.get("card_number") or "",
+                    language=entry.get("language") or "en",
+                    last_price=entry.get("best_price"),
+                    price_currency=entry.get("price_currency") or "USD",
+                )
+                if qty > 1:
+                    row = self._col_repo.find_by_identity(
+                        api_id=api_id,
+                        name=entry.get("name") or "",
+                        set_name=entry.get("set_name") or "",
+                        card_number=entry.get("card_number") or "",
+                        language=entry.get("language") or "en",
+                    )
+                    if row:
+                        self._col_repo.set_quantity(row["id"], qty)
+                added += 1
+
+        parts: list[str] = []
+        if added:
+            parts.append(f"{added} Karte(n) hinzugef\u00fcgt")
+        if skipped:
+            parts.append(f"{skipped} \u00fcbersprungen")
+        if parts:
+            self._set_status("Sammlung: " + ", ".join(parts) + ".")
+        if added:
             self._load_sammlung(_fetch_images=False)
 
     def _set_status(self, msg: str) -> None:
@@ -2886,3 +3481,12 @@ class CatalogDialog(QDialog):
             self._load_sammlung()
         elif index == 2:
             self._top_widget.load_if_needed()
+
+    def _on_samm_inner_tab_changed(self, index: int) -> None:
+        """Called when user switches between 'Karten' and 'Alben' subtabs."""
+        if index == 1:  # Alben
+            self._alben_widget.refresh()
+
+
+# Backward-compatibility alias
+CatalogDialog = CatalogWidget

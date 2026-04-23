@@ -20,4 +20,8 @@ class Database:
         schema_path = Path(__file__).with_name("schema.sql")
         with self.connect() as conn:
             conn.executescript(schema_path.read_text(encoding="utf-8"))
+            # Migration: add purchase_price column if missing (pre-existing DBs)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(collection_entries)").fetchall()}
+            if "purchase_price" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN purchase_price REAL")
             conn.commit()

@@ -9,7 +9,6 @@ import cv2
 import numpy as np
 from PIL import Image as _PilImage
 from PIL import ExifTags as _ExifTags
-import urllib.request
 from PySide6.QtCore import Qt, QEvent, QThread, Signal, QTimer, QRect
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -42,6 +41,7 @@ from src.pokemon_scanner.datasources.base import CardCandidate
 from src.pokemon_scanner.db.catalog_repository import CatalogRepository
 from src.pokemon_scanner.db.repositories import AlbumPageRepository, OcrCorrectionRepository
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
+from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
 
 
 def _compute_phash(image_path: str) -> str:
@@ -94,22 +94,13 @@ THUMB_H = 263
 
 
 def _load_card_pixmap(candidate: CardCandidate, w: int, h: int) -> QPixmap | None:
-    """Return a scaled QPixmap from local catalog, or None if not available.
-
-    Single source of truth for thumbnail loading — used by TileWidget and
-    _CardResultRow to avoid duplicated image-loading logic.
-    """
-    try:
-        if candidate.notes and candidate.notes.startswith("ID: "):
-            api_id = candidate.notes[4:].strip()
-            local = CATALOG_IMAGES_DIR / f"{api_id}.jpg"
-            if local.exists():
-                pix = QPixmap(str(local))
-                if not pix.isNull():
-                    return pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    except Exception:
-        pass
-    return None
+    """Return a scaled QPixmap from local catalog, or None if not available."""
+    api_id = candidate.api_id or (
+        candidate.notes[4:].strip()
+        if candidate.notes and candidate.notes.startswith("ID: ")
+        else ""
+    )
+    return load_card_pixmap(api_id, w=w, h=h) if api_id else None
 
 
 # ---------------------------------------------------------------------------
@@ -496,21 +487,9 @@ class TileWidget(QFrame):
 # Image fetch worker + result row widget
 # ---------------------------------------------------------------------------
 
-class _ImageFetchWorker(QThread):
-    done = Signal(object)  # bytes or None
-
-    def __init__(self, url: str) -> None:
-        super().__init__()
-        self._url = url
-
-    def run(self) -> None:
-        try:
-            req = urllib.request.Request(self._url, headers={"User-Agent": "CardLens/1.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = resp.read()
-            self.done.emit(data)
-        except Exception:
-            self.done.emit(None)
+class _ImageFetchWorker(CardImageDownloadWorker):
+    """Alias kept for backwards compatibility within this module."""
+    pass
 
 
 _RESULT_IMG_W = 158
@@ -570,20 +549,26 @@ class _CardResultRow(QFrame):
             self._img_lbl.setPixmap(pix)
             self._img_lbl.setText("")
         elif candidate.image_url:
-            self._worker = _ImageFetchWorker(candidate.image_url)
-            self._worker.done.connect(self._on_image)
-            self._worker.start()
+            _api_id = candidate.api_id or (
+                candidate.notes[4:].strip()
+                if candidate.notes and candidate.notes.startswith("ID: ")
+                else ""
+            )
+            if _api_id:
+                self._worker = CardImageDownloadWorker(_api_id, candidate.image_url)
+                self._worker.done.connect(self._on_image)
+                self._worker.start()
+            else:
+                self._img_lbl.setText("?")
         else:
             self._img_lbl.setText("?")
 
-    def _on_image(self, data) -> None:
-        if data:
-            pix = QPixmap()
-            pix.loadFromData(data)
-            if not pix.isNull():
-                self._img_lbl.setPixmap(
-                    pix.scaled(_RESULT_IMG_W, _RESULT_IMG_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                )
+    def _on_image(self, local_path: str) -> None:
+        if local_path:
+            pix = _load_card_pixmap(self._candidate, _RESULT_IMG_W, _RESULT_IMG_H)
+            if pix and not pix.isNull():
+                self._img_lbl.setPixmap(pix)
+                self._img_lbl.setText("")
                 return
         self._img_lbl.setText("?")
 

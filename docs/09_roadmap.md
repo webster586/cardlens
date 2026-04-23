@@ -33,3 +33,9 @@
   - Album-Rotation In-Memory
 - Queueing, Debounce, Statistiken — offen
 - Batch-Scan mehrerer Karten — offen
+
+## Phase 8 Album & Sammlung UX -- DONE
+- Unified Image-Architektur (`image_cache.py`) für alle UI-Module
+- Finish-Dropdown (11 Optionen) in Kartenbearbeitungs-Dialog
+- Album umbenennen via Doppelklick
+- Album-Seite Auto-Fill beim Einfügen und Verschieben von Karten

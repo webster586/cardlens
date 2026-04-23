@@ -26,6 +26,14 @@ class CollectionRepository:
                 conn.execute("ALTER TABLE collection_entries ADD COLUMN condition TEXT DEFAULT 'NM'")
             if "album_page" not in cols:
                 conn.execute("ALTER TABLE collection_entries ADD COLUMN album_page TEXT DEFAULT ''")
+            if "is_foil" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN is_foil INTEGER DEFAULT 0")
+            if "finish" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN finish TEXT DEFAULT ''")
+                # Back-fill: old holo entries get finish = 'holo'
+                conn.execute(
+                    "UPDATE collection_entries SET finish = 'holo' WHERE is_foil = 1 AND (finish IS NULL OR finish = '')"
+                )
             # Backfill api_id for existing rows that are missing it, by matching
             # name + set_name + card_number against card_catalog (same DB file).
             catalog_exists = conn.execute(
@@ -140,6 +148,137 @@ class CollectionRepository:
             )
             conn.commit()
 
+    def update_entry(
+        self,
+        entry_id: int,
+        *,
+        quantity: int,
+        language: str,
+        condition: str,
+        finish: str = "",
+        notes: str,
+        album_page: str,
+        purchase_price: float | None = None,
+    ) -> None:
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE collection_entries
+                SET quantity = ?, language = ?, condition = ?, finish = ?,
+                    is_foil = ?, notes = ?, album_page = ?, purchase_price = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (quantity, language, condition, finish,
+                 1 if finish else 0,
+                 notes, album_page,
+                 purchase_price if purchase_price else None, now, entry_id),
+            )
+            conn.commit()
+
+    def update_album_page(self, entry_id: int, album_page: str) -> None:
+        """Overwrite only the album_page field for a collection entry."""
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET album_page = ?, updated_at = ? WHERE id = ?",
+                (album_page, now, entry_id),
+            )
+            conn.commit()
+
+    def get_entry(self, entry_id: int) -> dict | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT id, api_id, name, set_name, card_number, language, quantity,"
+                " last_price, purchase_price, price_currency, notes, image_path, condition, album_page,"
+                " is_foil, finish, created_at, updated_at"
+                " FROM collection_entries WHERE id = ?",
+                (entry_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_entries_by_api_id(self, api_id: str) -> list[dict]:
+        """Return all collection entries that share the given api_id, ordered by id."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, api_id, name, set_name, card_number, language, quantity,"
+                " last_price, purchase_price, price_currency, notes, image_path, condition, album_page,"
+                " is_foil, finish, created_at, updated_at"
+                " FROM collection_entries WHERE api_id = ? ORDER BY id ASC",
+                (api_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_or_create_entry_by_api_id(
+        self,
+        *,
+        api_id: str,
+        name: str,
+        set_name: str,
+        card_number: str,
+        image_path: str | None,
+        language: str = "en",
+    ) -> int | None:
+        """Return existing collection entry id for api_id, or create one (qty=1, NM)."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM collection_entries WHERE api_id = ? LIMIT 1",
+                (api_id,),
+            ).fetchone()
+            if row:
+                return row["id"]
+            now = dt.datetime.utcnow().isoformat()
+            cur = conn.execute(
+                """INSERT INTO collection_entries
+                   (api_id, name, set_name, card_number, language, quantity,
+                    condition, image_path, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, 'NM', ?, ?, ?)""",
+                (api_id, name, set_name, card_number, language, image_path, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def split_entry(self, entry_id: int) -> list[int]:
+        """Split a quantity-N entry into N separate entries with quantity 1 each.
+
+        Returns the list of all entry IDs (original first, then newly created ones).
+        If quantity <= 1 the entry is unchanged and [entry_id] is returned.
+        """
+        row = self.get_entry(entry_id)
+        if not row:
+            return [entry_id]
+        qty = int(row.get("quantity") or 1)
+        if qty <= 1:
+            return [entry_id]
+        now = dt.datetime.utcnow().isoformat()
+        new_ids: list[int] = [entry_id]
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET quantity = 1, updated_at = ? WHERE id = ?",
+                (now, entry_id),
+            )
+            for _ in range(qty - 1):
+                cursor = conn.execute(
+                    "INSERT INTO collection_entries"
+                    " (api_id, name, set_name, card_number, language, quantity,"
+                    "  last_price, price_currency, notes, image_path, condition,"
+                    "  album_page, is_foil, finish, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        row["api_id"], row["name"], row["set_name"],
+                        row["card_number"], row["language"],
+                        row["last_price"], row["price_currency"],
+                        row["notes"], row["image_path"],
+                        row["condition"], row.get("album_page") or "",
+                        int(row.get("is_foil") or 0),
+                        row.get("finish") or "",
+                        now, now,
+                    ),
+                )
+                new_ids.append(cursor.lastrowid)
+            conn.commit()
+        return new_ids
+
     def find_by_identity(
         self,
         *,
@@ -176,7 +315,7 @@ class CollectionRepository:
         with self.database.connect() as conn:
             rows = conn.execute(
                 '''
-                SELECT id, api_id, name, set_name, card_number, language, quantity, last_price, price_currency, notes, image_path, condition, created_at, updated_at
+                SELECT id, api_id, name, set_name, card_number, language, quantity, last_price, price_currency, notes, image_path, condition, is_foil, finish, album_page, created_at, updated_at
                 FROM collection_entries
                 ORDER BY updated_at DESC, id DESC
                 '''
@@ -289,6 +428,15 @@ class CollectionRepository:
             conn.execute("UPDATE collection_entries SET api_id = ? WHERE id = ?", (api_id, entry_id))
             conn.commit()
 
+    def set_quantity(self, entry_id: int, quantity: int) -> None:
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET quantity = ?, updated_at = ? WHERE id = ?",
+                (quantity, now, entry_id),
+            )
+            conn.commit()
+
     def create_scan_event(
         self,
         *,
@@ -318,6 +466,239 @@ class CollectionRepository:
                 ),
             )
             conn.commit()
+
+
+class AlbumRepository:
+    """Manages physical binder albums: albums, pages, and card slots."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+        self._migrate()
+
+    def _migrate(self) -> None:
+        if "albums" in _schema_checked:
+            return
+        with self.database.connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    cols INTEGER NOT NULL DEFAULT 3,
+                    rows INTEGER NOT NULL DEFAULT 3,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS album_slots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    album_id INTEGER NOT NULL,
+                    page_num INTEGER NOT NULL,
+                    slot_index INTEGER NOT NULL,
+                    collection_entry_id INTEGER,
+                    FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE,
+                    UNIQUE(album_id, page_num, slot_index)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_album_slots_album ON album_slots(album_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_album_slots_entry ON album_slots(collection_entry_id)"
+            )
+            conn.commit()
+        _schema_checked.add("albums")
+
+    def create_album(self, name: str, cols: int = 3, rows: int = 3) -> int:
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO albums (name, cols, rows, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (name, cols, rows, now, now),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+    def delete_album(self, album_id: int) -> None:
+        with self.database.connect() as conn:
+            conn.execute("DELETE FROM album_slots WHERE album_id = ?", (album_id,))
+            conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
+            conn.commit()
+
+    def rename_album(self, album_id: int, name: str) -> None:
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE albums SET name = ?, updated_at = ? WHERE id = ?",
+                (name, now, album_id),
+            )
+            conn.commit()
+
+    def list_albums(self) -> list[dict]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, cols, rows, created_at, updated_at FROM albums ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_album(self, album_id: int) -> dict | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT id, name, cols, rows, created_at, updated_at FROM albums WHERE id = ?",
+                (album_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_album_page_count(self, album_id: int) -> int:
+        """Return number of pages based on highest page_num in use (0 if empty)."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(page_num) AS mp FROM album_slots WHERE album_id = ?",
+                (album_id,),
+            ).fetchone()
+        max_page = row["mp"] if row and row["mp"] is not None else -1
+        return max_page + 1
+
+    def get_album_totals(self, album_id: int) -> dict:
+        """Return summed market value and purchase cost for all slots in the album.
+
+        Keys: ``market`` (float), ``purchase`` (float | None – None if no entry has
+        a purchase_price set).
+        """
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    SUM(COALESCE(ce.last_price, cc.best_price)) AS market,
+                    SUM(ce.purchase_price)                       AS purchase
+                FROM album_slots s
+                LEFT JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ?
+                """,
+                (album_id,),
+            ).fetchone()
+        market = float(row["market"]) if row and row["market"] is not None else 0.0
+        purchase = float(row["purchase"]) if row and row["purchase"] is not None else None
+        return {"market": market, "purchase": purchase}
+
+    def get_page_slots_with_entries(self, album_id: int, page_num: int) -> list[dict]:
+        """Return slot data for a page, joined with collection + catalog info."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.slot_index,
+                    s.collection_entry_id,
+                    ce.name,
+                    ce.set_name,
+                    ce.card_number,
+                    ce.api_id,
+                    COALESCE(cc.local_image_path, ce.image_path) AS image_path,
+                    COALESCE(ce.last_price, cc.best_price) AS market_price,
+                    ce.purchase_price,
+                    cc.image_url AS catalog_image_url
+                FROM album_slots s
+                LEFT JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ? AND s.page_num = ?
+                ORDER BY s.slot_index ASC
+                """,
+                (album_id, page_num),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_slot(
+        self,
+        album_id: int,
+        page_num: int,
+        slot_index: int,
+        collection_entry_id: int | None,
+    ) -> None:
+        if collection_entry_id is None:
+            with self.database.connect() as conn:
+                conn.execute(
+                    "DELETE FROM album_slots WHERE album_id=? AND page_num=? AND slot_index=?",
+                    (album_id, page_num, slot_index),
+                )
+                conn.commit()
+        else:
+            with self.database.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO album_slots (album_id, page_num, slot_index, collection_entry_id)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(album_id, page_num, slot_index)
+                    DO UPDATE SET collection_entry_id = excluded.collection_entry_id
+                    """,
+                    (album_id, page_num, slot_index, collection_entry_id),
+                )
+                conn.commit()
+
+    def get_slot_entry_id(self, album_id: int, page_num: int, slot_index: int) -> int | None:
+        """Return the collection_entry_id in the given slot, or None if empty."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT collection_entry_id FROM album_slots"
+                " WHERE album_id=? AND page_num=? AND slot_index=?",
+                (album_id, page_num, slot_index),
+            ).fetchone()
+        return row["collection_entry_id"] if row else None
+
+    def swap_slots(self, album_id: int, p1: int, s1: int, p2: int, s2: int) -> None:
+        with self.database.connect() as conn:
+            r1 = conn.execute(
+                "SELECT collection_entry_id FROM album_slots WHERE album_id=? AND page_num=? AND slot_index=?",
+                (album_id, p1, s1),
+            ).fetchone()
+            r2 = conn.execute(
+                "SELECT collection_entry_id FROM album_slots WHERE album_id=? AND page_num=? AND slot_index=?",
+                (album_id, p2, s2),
+            ).fetchone()
+            eid1 = r1["collection_entry_id"] if r1 else None
+            eid2 = r2["collection_entry_id"] if r2 else None
+            conn.execute(
+                "DELETE FROM album_slots WHERE album_id=? AND page_num=? AND slot_index=?",
+                (album_id, p1, s1),
+            )
+            conn.execute(
+                "DELETE FROM album_slots WHERE album_id=? AND page_num=? AND slot_index=?",
+                (album_id, p2, s2),
+            )
+            if eid2 is not None:
+                conn.execute(
+                    "INSERT INTO album_slots (album_id,page_num,slot_index,collection_entry_id) VALUES(?,?,?,?)",
+                    (album_id, p1, s1, eid2),
+                )
+            if eid1 is not None:
+                conn.execute(
+                    "INSERT INTO album_slots (album_id,page_num,slot_index,collection_entry_id) VALUES(?,?,?,?)",
+                    (album_id, p2, s2, eid1),
+                )
+            conn.commit()
+
+    def get_album_set_logos(self, album_id: int) -> list[tuple[str, str | None]]:
+        """Return list of (set_name, local_logo_path) for distinct sets in this album."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ce.set_name, cc.set_local_logo_path
+                FROM album_slots s
+                JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ? AND ce.set_name IS NOT NULL AND ce.set_name != ''
+                ORDER BY ce.set_name
+                """,
+                (album_id,),
+            ).fetchall()
+        seen: set[str] = set()
+        result: list[tuple[str, str | None]] = []
+        for r in rows:
+            sn = r["set_name"]
+            if sn not in seen:
+                seen.add(sn)
+                result.append((sn, r["set_local_logo_path"]))
+        return result
 
 
 class AlbumPageRepository:

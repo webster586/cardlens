@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS collection_entries (
     language TEXT,
     quantity INTEGER NOT NULL DEFAULT 1,
     last_price REAL,
+    purchase_price REAL,
     price_currency TEXT,
     notes TEXT,
     image_path TEXT,
@@ -66,3 +67,25 @@ CREATE TABLE IF NOT EXISTS ocr_corrections (
 );
 
 CREATE INDEX IF NOT EXISTS ix_ocr_corrections_raw ON ocr_corrections(ocr_raw);
+
+CREATE TABLE IF NOT EXISTS albums (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    cols INTEGER NOT NULL DEFAULT 3,
+    rows INTEGER NOT NULL DEFAULT 3,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS album_slots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    album_id INTEGER NOT NULL,
+    page_num INTEGER NOT NULL,
+    slot_index INTEGER NOT NULL,
+    collection_entry_id INTEGER,
+    FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE,
+    UNIQUE(album_id, page_num, slot_index)
+);
+
+CREATE INDEX IF NOT EXISTS ix_album_slots_album ON album_slots(album_id);
+CREATE INDEX IF NOT EXISTS ix_album_slots_entry ON album_slots(collection_entry_id);

@@ -151,6 +151,7 @@ class CatalogRepository:
             "eur_price": "REAL",
             "usd_price": "REAL",
             "set_release_year": "INTEGER",
+            "tcgplayer_url": "TEXT",
         }
         _safe_types = {"TEXT", "INTEGER", "REAL", "BLOB"}
         for col_name, col_type in new_cols.items():
@@ -238,6 +239,7 @@ class CatalogRepository:
                         c.artist, c.pokedex_numbers, c.regulation_mark,
                         c.legalities, c.set_series, c.set_total,
                         c.eur_price, c.usd_price, release_year,
+                        getattr(c, 'tcgplayer_url', '') or "",
                         now, api_id,
                     ))
                     if not existing[api_id] and c.image_url:
@@ -251,6 +253,7 @@ class CatalogRepository:
                         c.artist, c.pokedex_numbers, c.regulation_mark,
                         c.legalities, c.set_series, c.set_total,
                         c.set_symbol_url, c.eur_price, c.usd_price, release_year,
+                        getattr(c, 'tcgplayer_url', '') or "",
                         now, now,
                     ))
                     if c.image_url:
@@ -265,6 +268,7 @@ class CatalogRepository:
                            artist=?, pokedex_numbers=?, regulation_mark=?,
                            legalities=?, set_series=?, set_total=?,
                            eur_price=?, usd_price=?, set_release_year=?,
+                           tcgplayer_url=?,
                            updated_at=?
                        WHERE api_id=?""",
                     update_rows,
@@ -279,8 +283,9 @@ class CatalogRepository:
                         artist, pokedex_numbers, regulation_mark,
                         legalities, set_series, set_total,
                         set_symbol_url, eur_price, usd_price, set_release_year,
+                        tcgplayer_url,
                         fetched_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     insert_rows,
                 )
             conn.commit()
@@ -429,40 +434,94 @@ class CatalogRepository:
                           artist, pokedex_numbers, regulation_mark,
                           legalities, set_series, set_total,
                           set_symbol_url, set_symbol_local_path, eur_price, usd_price,
+                          tcgplayer_url,
                           fetched_at, updated_at
                    FROM card_catalog ORDER BY set_name ASC, card_number ASC"""
             ).fetchall()
         return [dict(r) for r in rows]
 
     def search(self, query: str) -> list[dict[str, Any]]:
+        from src.pokemon_scanner.core.name_translations import translate_to_en, translate_to_de
+
         prefix_q = f"{query}%"
         any_q = f"%{query}%"
+
+        # Build extra name terms for DE↔EN cross-search
+        q_lower = query.lower().strip()
+        en_equiv = translate_to_en(q_lower)   # DE input  → EN name
+        de_equiv = translate_to_de(q_lower)   # EN input  → DE name
+
+        # Collect all LIKE patterns to OR together for the name column
+        name_likes: list[str] = [prefix_q, any_q]
+        if en_equiv:
+            name_likes += [f"{en_equiv}%", f"%{en_equiv}%"]
+        if de_equiv:
+            name_likes += [f"{de_equiv}%", f"%{de_equiv}%"]
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_name_likes: list[str] = []
+        for p in name_likes:
+            if p not in seen:
+                seen.add(p)
+                unique_name_likes.append(p)
+
+        name_clause = " OR ".join(["name LIKE ?"] * len(unique_name_likes))
+        sql = f"""SELECT api_id, name, set_name, card_number, language,
+                         best_price, price_currency, image_url, local_image_path,
+                         set_logo_url, set_local_logo_path, set_release_date,
+                         rarity, supertype, subtypes, hp, types,
+                         artist, pokedex_numbers, regulation_mark,
+                         legalities, set_series, set_total,
+                         set_symbol_url, set_symbol_local_path, eur_price, usd_price,
+                         tcgplayer_url,
+                         fetched_at, updated_at
+                  FROM card_catalog
+                  WHERE ({name_clause}) OR set_name LIKE ? OR card_number LIKE ?
+                  ORDER BY set_name ASC, card_number ASC"""
+        params = tuple(unique_name_likes) + (any_q, any_q)
         with self.database.connect() as conn:
-            rows = conn.execute(
-                """SELECT api_id, name, set_name, card_number, language,
-                          best_price, price_currency, image_url, local_image_path,
-                          set_logo_url, set_local_logo_path, set_release_date,
-                          rarity, supertype, subtypes, hp, types,
-                          artist, pokedex_numbers, regulation_mark,
-                          legalities, set_series, set_total,
-                          set_symbol_url, set_symbol_local_path, eur_price, usd_price,
-                          fetched_at, updated_at
-                   FROM card_catalog
-                   WHERE name LIKE ? OR set_name LIKE ? OR card_number LIKE ?
-                   ORDER BY set_name ASC, card_number ASC""",
-                (prefix_q, any_q, any_q),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    def get_by_api_id(self, api_id: str) -> "dict | None":
+        """Return catalog data for a single card by api_id, or None if not found."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT api_id, name, set_name, card_number, language,"
+                " best_price, price_currency, image_url, local_image_path,"
+                " set_logo_url, set_local_logo_path, set_release_date,"
+                " rarity, supertype, subtypes, hp, types,"
+                " artist, pokedex_numbers, regulation_mark,"
+                " legalities, set_series, set_total,"
+                " set_symbol_url, set_symbol_local_path, eur_price, usd_price,"
+                " tcgplayer_url, fetched_at, updated_at"
+                " FROM card_catalog WHERE api_id = ?",
+                (api_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def update_release_dates(self, mapping: dict[str, str]) -> None:
-        """Set set_release_date for all catalog entries matching each set_name."""
+        """Set set_release_date and set_release_year for all catalog entries matching each set_name."""
         with self.database.connect() as conn:
             for set_name, release_date in mapping.items():
+                # Fill missing set_release_date strings
                 conn.execute(
                     "UPDATE card_catalog SET set_release_date=?"
                     " WHERE set_name=? AND (set_release_date IS NULL OR set_release_date='')",
                     (release_date, set_name),
                 )
+                # Always backfill set_release_year (integer) where NULL — separate
+                # query so cards that already had set_release_date also get the year.
+                year: int | None = None
+                if len(release_date) >= 4 and release_date[:4].isdigit():
+                    year = int(release_date[:4])
+                if year:
+                    conn.execute(
+                        "UPDATE card_catalog SET set_release_year=?"
+                        " WHERE set_name=? AND set_release_year IS NULL",
+                        (year, set_name),
+                    )
             conn.commit()
 
     def get_top_performers(

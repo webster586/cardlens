@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import tempfile
-import urllib.request
 from pathlib import Path
 
 import cv2
@@ -13,6 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRubberBand,
     QSlider,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -45,7 +46,8 @@ from src.pokemon_scanner.recognition.ocr import OcrEngine
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
 from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, DisclaimerDialog
 from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog
-from src.pokemon_scanner.ui.catalog_dialog import CatalogDialog
+from src.pokemon_scanner.ui.catalog_dialog import CatalogWidget
+from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
 
 
 def _cleanup_scan_photos(repo: "CollectionRepository") -> None:
@@ -99,41 +101,6 @@ class CatalogSaveWorker(QThread):
                 self._repo.save_set_logo(set_name, logo_url)
         except Exception as exc:
             logging.getLogger(__name__).warning("CatalogSaveWorker error: %s", exc)
-
-
-class ImageDownloadWorker(QThread):
-    finished = Signal(QPixmap)
-
-    def __init__(self, url: str) -> None:
-        super().__init__()
-        self._url = url
-
-    def run(self) -> None:
-        _MAX_BYTES = 10 * 1024 * 1024  # 10 MB hard cap
-        try:
-            req = urllib.request.Request(self._url, headers={"User-Agent": "CardLens/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                cl = resp.headers.get("Content-Length")
-                if cl and int(cl) > _MAX_BYTES:
-                    self.finished.emit(QPixmap())
-                    return
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _MAX_BYTES:
-                        self.finished.emit(QPixmap())
-                        return
-                    chunks.append(chunk)
-            data = b"".join(chunks)
-            pixmap = QPixmap()
-            pixmap.loadFromData(data)
-            self.finished.emit(pixmap)
-        except Exception:
-            self.finished.emit(QPixmap())
 
 
 class ManualSearchWorker(QThread):
@@ -203,9 +170,10 @@ class MainWindow(QMainWindow):
         )
         self.camera_service = CameraService()
         self.current_candidates: list[CardCandidate] = []
+        self.current_image_path: str = ""
         self._scan_worker: ScanWorker | None = None
         self._manual_search_worker: ManualSearchWorker | None = None
-        self._image_dl_workers: list[ImageDownloadWorker] = []
+        self._image_dl_workers: list[CardImageDownloadWorker] = []
         self._catalog_save_workers: list[CatalogSaveWorker] = []
         self._active_lang: str = settings.preferred_language
         self._collection_cols_sized: bool = False
@@ -309,10 +277,132 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self.status_label.setText("Disclaimer zurückgesetzt — wird beim nächsten Start erneut angezeigt.")
 
+    # ── Nav-button style constants ──────────────────────────────────────────
+    _NAV_ACTIVE = (
+        "background:#252741;color:#fff;border:none;"
+        "border-left:3px solid #5865f2;border-radius:0;"
+        "padding:10px 16px 10px 13px;"
+        "text-align:left;font-size:13px;min-height:44px;"
+    )
+    _NAV_INACTIVE = (
+        "background:transparent;color:#9ca3af;border:none;"
+        "border-radius:6px;padding:10px 16px;"
+        "text-align:left;font-size:13px;min-height:44px;"
+    )
+
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        main_layout = QVBoxLayout(root)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Left sidebar ──────────────────────────────────────────────────
+        sidebar = self._build_sidebar()
+        outer.addWidget(sidebar)
+
+        # ── Thin separator ────────────────────────────────────────────────
+        sep_line = QFrame()
+        sep_line.setFrameShape(QFrame.VLine)
+        sep_line.setFixedWidth(1)
+        sep_line.setStyleSheet("background:#334155;border:none;")
+        outer.addWidget(sep_line)
+
+        # ── Content stack ─────────────────────────────────────────────────
+        content_wrap = QWidget()
+        content_wrap.setStyleSheet("background:#1e2030;")
+        content_layout = QVBoxLayout(content_wrap)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        self._stack = QStackedWidget()
+        content_layout.addWidget(self._stack, 1)
+
+        self.status_label = QLabel("Bereit")
+        self.status_label.setMinimumHeight(24)
+        self.status_label.setStyleSheet(
+            "color:#94a3b8;font-size:11px;padding:2px 10px;"
+            "border-top:1px solid #334155;background:#151726;"
+        )
+        content_layout.addWidget(self.status_label)
+
+        outer.addWidget(content_wrap, 1)
+
+        # ── Page 0: Katalog ───────────────────────────────────────────────
+        self._catalog_widget = CatalogWidget(
+            self.catalog_repo,
+            self.collection_service.repository,
+            settings=self.settings,
+        )
+        self._stack.addWidget(self._catalog_widget)
+
+        # ── Page 1: Scanner ───────────────────────────────────────────────
+        scanner_page = self._build_scanner_page(root)
+        self._stack.addWidget(scanner_page)
+
+        # Default: Katalog
+        self._stack.setCurrentIndex(0)
+
+    def _build_sidebar(self) -> QFrame:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(190)
+        sidebar.setStyleSheet(
+            "QFrame#sidebar { background: #0f1117; }"
+            "QFrame#sidebar QPushButton:hover { background: #1e2030; color: #e2e8f0; }"
+        )
+        lay = QVBoxLayout(sidebar)
+        lay.setContentsMargins(8, 16, 8, 16)
+        lay.setSpacing(4)
+
+        title = QLabel("CardLens")
+        title.setStyleSheet(
+            "color:#e2e8f0;font-size:18px;font-weight:bold;"
+            "padding:6px 8px 14px 8px;border:none;background:transparent;"
+        )
+        lay.addWidget(title)
+
+        nav_defs = [
+            ("📋  Katalog",       0, 0),
+            ("📷  Scanner",       1, -1),
+            ("⭐  Sammlung",      0, 1),
+            ("🏆  Top-Performer", 0, 2),
+        ]
+        self._nav_buttons: list[QPushButton] = []
+        for i, (label, page_idx, tab_idx) in enumerate(nav_defs):
+            btn = QPushButton(label)
+            btn.setStyleSheet(self._NAV_ACTIVE if i == 0 else self._NAV_INACTIVE)
+            btn.clicked.connect(lambda _=False, p=page_idx, t=tab_idx: self._nav_click(p, t))
+            lay.addWidget(btn)
+            self._nav_buttons.append(btn)
+
+        lay.addStretch()
+
+        btn_settings = QPushButton("⚙  Einstellungen")
+        btn_settings.setStyleSheet(self._NAV_INACTIVE)
+        btn_settings.clicked.connect(self._open_api_key_dialog)
+        lay.addWidget(btn_settings)
+
+        return sidebar
+
+    def _nav_click(self, page_idx: int, tab_idx: int = -1) -> None:
+        self._stack.setCurrentIndex(page_idx)
+        if page_idx == 0 and tab_idx >= 0:
+            self._catalog_widget.show_page(tab_idx)
+        self._set_nav_active_for(page_idx, tab_idx)
+
+    def _set_nav_active(self, btn_idx: int) -> None:
+        for i, btn in enumerate(self._nav_buttons):
+            btn.setStyleSheet(self._NAV_ACTIVE if i == btn_idx else self._NAV_INACTIVE)
+
+    def _set_nav_active_for(self, page_idx: int, tab_idx: int) -> None:
+        mapping = {(0, 0): 0, (1, -1): 1, (0, 1): 2, (0, 2): 3}
+        btn_idx = mapping.get((page_idx, tab_idx), 0)
+        self._set_nav_active(btn_idx)
+
+    def _build_scanner_page(self, root: QWidget) -> QWidget:
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
 
         # --- Input row: camera controls + separator + file load ---
         input_group = QGroupBox("Eingabe")
@@ -391,11 +481,6 @@ class MainWindow(QMainWindow):
         ]:
             button.setMinimumHeight(40)
             action_row.addWidget(button)
-
-        self.btn_catalog = QPushButton("\U0001f4d6  Katalog")
-        self.btn_catalog.setMinimumHeight(40)
-        self.btn_catalog.setMinimumWidth(100)
-        action_row.addWidget(self.btn_catalog)
 
         self.btn_album_scan = QPushButton("\U0001f4f7  Scan Album")
         self.btn_album_scan.setMinimumHeight(40)
@@ -577,12 +662,6 @@ class MainWindow(QMainWindow):
             ["ID", "Name", "Set", "Nummer", "Sprache", "Menge", "Preis", "W\u00e4hrung"]
         )
         collection_layout.addWidget(self.collection_table)
-        # Collection is now shown in the Katalog dialog (Sammlung tab)
-        # grid.addWidget(collection_group, 0, 2)  # removed
-
-        self.status_label = QLabel("Bereit")
-        self.status_label.setMinimumHeight(28)
-        main_layout.addWidget(self.status_label)
 
         # Signals
         self.btn_camera_toggle.clicked.connect(self._toggle_camera)
@@ -599,8 +678,9 @@ class MainWindow(QMainWindow):
         self.candidate_table.cellDoubleClicked.connect(self._on_candidate_double_clicked)
         self.candidate_table.installEventFilter(self)
         self.lbl_card_image.installEventFilter(self)
-        self.btn_catalog.clicked.connect(self._open_catalog)
         self.btn_album_scan.clicked.connect(self._open_album_scan)
+
+        return page
 
     def _populate_camera_combo(self) -> None:
         self.camera_combo.clear()
@@ -942,8 +1022,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _open_catalog(self) -> None:
-        dlg = CatalogDialog(self.catalog_repo, self.collection_service.repository, self, settings=self.settings)
-        dlg.exec()
+        self._nav_click(0, 0)
 
     def _open_album_scan(self) -> None:
         dlg = AlbumScanDialog(
@@ -1091,35 +1170,36 @@ class MainWindow(QMainWindow):
                     "background: transparent; border: none;"
                     " font-size: 11px; color: #aaa;"
                 )
-        # Load card image — prefer local file, fall back to HTTP download
+        # Load card image — prefer local catalog file, fall back to HTTP download
         self.lbl_card_image.setText("Lade\u2026")
         self.lbl_card_image.setPixmap(QPixmap())
         img = candidate.image_url or ""
-        if img and Path(img).exists():
-            # Local file — load directly, no network needed
-            px = QPixmap(img).scaled(
-                self.lbl_card_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        # Try local catalog first (no network)
+        pix = load_card_pixmap(candidate.api_id, stored_hint=img if not img.startswith("http") else None)
+        if pix and not pix.isNull():
+            self.lbl_card_image.setPixmap(
+                pix.scaled(self.lbl_card_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
-            if px.isNull():
-                self.lbl_card_image.setText("Bild nicht\nverfügbar")
-            else:
-                self.lbl_card_image.setPixmap(px)
-                self.lbl_card_image.setText("")
-        elif img and img.startswith("http"):
-            worker = ImageDownloadWorker(img)
+            self.lbl_card_image.setText("")
+        elif img and img.startswith("http") and candidate.api_id:
+            worker = CardImageDownloadWorker(candidate.api_id, img)
             self._image_dl_workers.append(worker)
-            worker.finished.connect(self._on_card_image_loaded)
-            worker.finished.connect(lambda _px, w=worker: self._image_dl_workers.remove(w) if w in self._image_dl_workers else None)
+            worker.done.connect(self._on_card_image_loaded)
+            worker.done.connect(lambda _p, w=worker: self._image_dl_workers.remove(w) if w in self._image_dl_workers else None)
             worker.start()
         else:
             self.lbl_card_image.setText("Kein Bild")
 
-    def _on_card_image_loaded(self, pixmap: QPixmap) -> None:
-        if pixmap.isNull():
+    def _on_card_image_loaded(self, local_path: str) -> None:
+        if not local_path:
+            self.lbl_card_image.setText("Bild nicht\nverfügbar")
+            return
+        pm = QPixmap(local_path)
+        if pm.isNull():
             self.lbl_card_image.setText("Bild nicht\nverfügbar")
         else:
             self.lbl_card_image.setPixmap(
-                pixmap.scaled(self.lbl_card_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm.scaled(self.lbl_card_image.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
 
     def _on_candidate_row_changed(self) -> None:
@@ -1558,6 +1638,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, '_catalog_widget'):
+            self._catalog_widget.stop_workers()
         self._stop_camera()
         # Stop all background workers gracefully before exit
         for worker in [self._scan_worker, self._manual_search_worker, self._ocr_warmup_worker]:

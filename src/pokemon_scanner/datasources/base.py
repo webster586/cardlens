@@ -40,3 +40,5 @@ class CardCandidate:
     eur_price: float | None = None
     usd_price: float | None = None
     api_id: str = ""
+    set_release_date: str = ""
+    tcgplayer_url: str = ""

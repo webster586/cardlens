@@ -172,6 +172,7 @@ class PokemonTcgAdapter:
                     set_symbol_url=set_images.get("symbol") or "",
                     eur_price=eur,
                     usd_price=usd,
+                    tcgplayer_url=card.get("tcgplayer", {}).get("url") or "",
                 )
             )
         # LRU eviction: discard oldest entry when cache is at max capacity
