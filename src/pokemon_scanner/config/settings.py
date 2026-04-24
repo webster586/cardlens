@@ -34,6 +34,8 @@ class AppSettings:
     pokemontcg_api_key: str = ""
     # Set to True after the user has accepted the first-run disclaimer.
     disclaimer_accepted: bool = False
+    # Start the application maximized (fullscreen). Can be toggled in settings.
+    start_maximized: bool = True
 
     @classmethod
     def settings_file(cls) -> Path:

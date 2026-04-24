@@ -40,7 +40,6 @@ _SEED: dict[str, str] = {
     "Schiggy": "Squirtle",
     "Pikachu": "Pikachu",
     "Evoli": "Eevee",
-    "Glurak": "Charizard",
     "Dragoran": "Dragonite",
     "Garados": "Gyarados",
     "Raichu": "Raichu",
@@ -214,6 +213,13 @@ _OCR_SUBSTITUTIONS: list[tuple[str, str]] = [
     ("1", "l"),     # one → lowercase L
 ]
 
+# Pokémon card type suffixes that may appear at the end of an OCR result.
+# Used to strip them before base-name fuzzy matching (e.g. "UmbreonVax VMAX"
+# → strip "VMAX", match "UmbreonVax" → "Umbreon", reconstruct "Umbreon VMAX").
+_CARD_TYPE_SUFFIXES: frozenset[str] = frozenset({
+    "vmax", "vstar", "gx", "ex", "v", "tag", "team", "legend",
+})
+
 
 def _fuzzy_inner(
     candidate: str,
@@ -337,7 +343,31 @@ def correct_ocr_pokemon_name(raw_ocr: str) -> str | None:
             result_oi = en_names[en_names_lower.index(candidate_oi)]
             _LOG.debug("OCR correction: %r → %r via ol→oi substitution", raw_ocr, result_oi)
             return result_oi
-
+    # 2c. If the last token is a known card-type suffix (VMAX, GX, …), strip it
+    #     and try matching the base name — handles OCR merging artefacts such as
+    #     "UmbreonVax VMAX" where the base word "UmbreonVax" is close enough to
+    #     "Umbreon" but the added token inflates edit distance beyond all cutoffs.
+    _raw_parts = raw_ocr.split()
+    if len(_raw_parts) >= 2 and _raw_parts[-1].lower() in _CARD_TYPE_SUFFIXES:
+        _suffix = _raw_parts[-1]
+        _base = " ".join(_raw_parts[:-1])
+        # Try exact lookup first (covers cards where base name is a clean DE/EN name).
+        _exact_base = translate_to_en(_base)
+        if _exact_base:
+            _LOG.debug("OCR correction: %r \u2192 %r (suffix-stripped exact)", raw_ocr, _exact_base + " " + _suffix)
+            return _exact_base + " " + _suffix
+        # Try fuzzy on each word of the base name (handles "UmbreonVax" \u2192 "Umbreon").
+        # Use a stricter cutoff (0.72) to avoid false positives like "umbreon" \u2192
+        # "lumineon" which score ~0.67 and would pass a 0.65 threshold.
+        for _w in _base.split():
+            if len(_w) >= 4:
+                _mk, _r = _fuzzy(_w, cutoff=0.72)
+                if _r and _mk and _plausible(_w, _mk, threshold=0.72):
+                    _LOG.debug(
+                        "OCR correction: %r \u2192 %r (base-word %r + suffix %r)",
+                        raw_ocr, _r + " " + _suffix, _w, _suffix,
+                    )
+                    return _r + " " + _suffix
     # 3. Try individual words only for single-word OCR output.
     # Multi-word OCR (2+ words) is almost always a trainer/item card name —
     # splitting it and matching individual words causes false Pokémon hits

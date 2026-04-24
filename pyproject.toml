@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cardlens"
-version = "0.4.0"
+version = "0.4.4"
 description = "Desktop app for scanning, identifying and managing TCG cards"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -12,3 +12,6 @@ keywords = ["tcg", "pokemon", "card", "scanner", "collection"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-cov"]

@@ -39,5 +39,8 @@ def main() -> int:
         logger.info("Disclaimer accepted. API key set: %s", bool(settings.pokemontcg_api_key))
 
     window = MainWindow(settings=settings, database=database)
-    window.show()
+    if settings.start_maximized:
+        window.showMaximized()
+    else:
+        window.show()
     return app.exec()

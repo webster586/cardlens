@@ -13,9 +13,6 @@ from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
 from src.pokemon_scanner.datasources.base import CardCandidate
 from src.pokemon_scanner.db.database import Database
 
-# Skip PRAGMA table_info once the catalog schema has been migrated in this process
-_schema_checked: set[str] = set()
-
 # Only download images from trusted pokemontcg.io hosts
 _ALLOWED_IMAGE_HOSTS: frozenset[str] = frozenset({
     "images.pokemontcg.io",
@@ -50,7 +47,10 @@ _LOG = logging.getLogger(__name__)
 
 
 def _extract_api_id(candidate: CardCandidate) -> str | None:
-    """Extract the pokemontcg.io card ID from the notes field ('ID: sv3pt5-76')."""
+    """Return the pokemontcg.io card ID from candidate.api_id (preferred) or notes field."""
+    if candidate.api_id:
+        return candidate.api_id
+    # Legacy fallback: some callers may not have set api_id but store it in notes
     if candidate.notes and candidate.notes.startswith("ID: "):
         return candidate.notes[4:].strip()
     return None
@@ -59,11 +59,12 @@ def _extract_api_id(candidate: CardCandidate) -> str | None:
 class CatalogRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._schema_initialized: bool = False
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
         """Create table if missing and run column migrations."""
-        if "card_catalog" in _schema_checked:
+        if self._schema_initialized:
             return
         with self.database.connect() as conn:
             conn.execute("""
@@ -121,7 +122,7 @@ class CatalogRepository:
                 )
             """)
             self._migrate(conn)
-        _schema_checked.add("card_catalog")
+        self._schema_initialized = True
 
     def _migrate(self, conn) -> None:
         """Add columns introduced after initial schema to existing DBs."""
@@ -293,7 +294,7 @@ class CatalogRepository:
 
     def save_local_image(self, api_id: str, url: str) -> Path | None:
         """Download image from URL, save to catalog_images/{api_id}.jpg, update DB."""
-        if not url or not url.startswith(("http://", "https://")):
+        if not url or not url.startswith("https://"):
             return None
         if not _is_allowed_url(url):
             _LOG.warning("Rejected image download from non-whitelisted host: %s", url)
@@ -324,6 +325,7 @@ class CatalogRepository:
             _LOG.debug("Catalog image saved: %s (%d bytes)", dest.name, dest.stat().st_size)
             return dest
         except Exception as exc:
+            dest.unlink(missing_ok=True)  # remove partial/corrupt file
             _LOG.warning("Failed to download catalog image %s: %s", api_id, exc)
             return None
 
@@ -338,7 +340,7 @@ class CatalogRepository:
 
     def save_set_symbol(self, set_name: str, url: str) -> Path | None:
         """Download set symbol icon, cache locally, update all cards in this set."""
-        if not url or not url.startswith(("http://", "https://")):
+        if not url or not url.startswith("https://"):
             return None
         if not _is_allowed_url(url):
             _LOG.warning("Rejected set symbol download from non-whitelisted host: %s", url)
@@ -360,6 +362,7 @@ class CatalogRepository:
                             return None
                         fh.write(chunk)
             except Exception as exc:
+                dest.unlink(missing_ok=True)  # remove partial/corrupt file
                 _LOG.warning("Failed to download set symbol for %r: %s", set_name, exc)
                 return None
         now = dt.datetime.utcnow().isoformat()
@@ -374,7 +377,7 @@ class CatalogRepository:
 
     def save_set_logo(self, set_name: str, url: str) -> Path | None:
         """Download set logo, cache locally, update all cards in this set."""
-        if not url or not url.startswith(("http://", "https://")):
+        if not url or not url.startswith("https://"):
             return None
         if not _is_allowed_url(url):
             _LOG.warning("Rejected set logo download from non-whitelisted host: %s", url)
@@ -396,6 +399,7 @@ class CatalogRepository:
                             return None
                         fh.write(chunk)
             except Exception as exc:
+                dest.unlink(missing_ok=True)  # remove partial/corrupt file
                 _LOG.warning("Failed to download set logo for %r: %s", set_name, exc)
                 return None
         now = dt.datetime.utcnow().isoformat()

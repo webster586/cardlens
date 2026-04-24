@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.5 - 2026-04-24 - Markt UI-Verbesserungen
+
+### Changed
+- `ui/market_widget.py`: Marktpreis-Label in Verkauf- und Kauf-Zeilen: Schriftgröße von 12px auf 24px verdoppelt, Farbe auf Weiß (#ffffff) geändert
+- `ui/main_window.py`: Markt-Untermenüs (Verkauf, Kauf, Historie) aus linker Sidebar entfernt — Navigation erfolgt über Tab-Buttons im Markt-Widget
+
 ## 0.4.4 - 2026-04-23 - Album-Seite Auto-Fill
 
 ### Added

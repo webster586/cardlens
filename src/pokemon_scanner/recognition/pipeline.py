@@ -67,7 +67,7 @@ class RecognitionPipeline:
             return []
         return self._catalog_repo.search_candidates(name, number)
 
-    def scan_image(self, image_path: str | Path, language: str = "", zone: tuple[float, float, float, float] | None = None) -> tuple[list[CardCandidate], str]:
+    def scan_image(self, image_path: str | Path, language: str = "", zone: tuple[float, float, float, float] | None = None) -> tuple[list[CardCandidate], str, str]:
         """Return (candidates, warp_path_str, raw_ocr_text).
 
         *warp_path_str* is the path to the perspective-corrected card preview image,

@@ -19,10 +19,8 @@ class CollectionService:
         condition: str = "NM",
         album_page: str = "",
     ) -> None:
-        api_id: str | None = None
-        if candidate.notes and candidate.notes.startswith("ID: "):
-            raw_id = candidate.notes[4:].strip()
-            api_id = raw_id if _VALID_API_ID.match(raw_id) else None
+        raw_id = candidate.api_id or ""
+        api_id: str | None = raw_id if raw_id and _VALID_API_ID.match(raw_id) else None
         self.repository.upsert_by_identity(
             api_id=api_id,
             name=candidate.name,
@@ -49,9 +47,7 @@ class CollectionService:
         return self.repository.list_all()
 
     def find_by_candidate(self, candidate: "CardCandidate") -> "dict | None":
-        api_id: str | None = None
-        if candidate.notes and candidate.notes.startswith("ID: "):
-            api_id = candidate.notes[4:].strip()
+        api_id: str | None = candidate.api_id or None
         return self.repository.find_by_identity(
             api_id=api_id,
             name=candidate.name,

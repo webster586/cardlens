@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QGroupBox,
@@ -188,11 +189,11 @@ class DisclaimerDialog(QDialog):
 
 
 class ApiKeyDialog(QDialog):
-    """Standalone dialog for changing the pokemontcg.io API key later."""
+    """Settings dialog: API key + app preferences."""
 
-    def __init__(self, current_api_key: str = "", parent=None) -> None:
+    def __init__(self, current_api_key: str = "", start_maximized: bool = True, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("API-Schlüssel konfigurieren")
+        self.setWindowTitle("⚙ Einstellungen")
         self.setMinimumWidth(480)
 
         layout = QVBoxLayout(self)
@@ -225,6 +226,11 @@ class ApiKeyDialog(QDialog):
         row.addWidget(btn_show)
         layout.addLayout(row)
 
+        # ── App preferences ──────────────────────────────────────────────────
+        self._cb_maximized = QCheckBox("App immer maximiert starten")
+        self._cb_maximized.setChecked(start_maximized)
+        layout.addWidget(self._cb_maximized)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -233,6 +239,10 @@ class ApiKeyDialog(QDialog):
     @property
     def api_key(self) -> str:
         return self._input.text().strip()
+
+    @property
+    def start_maximized(self) -> bool:
+        return self._cb_maximized.isChecked()
 
 
 class AboutDialog(QDialog):

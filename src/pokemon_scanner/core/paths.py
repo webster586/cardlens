@@ -9,10 +9,8 @@ if getattr(sys, "frozen", False):
     # PyInstaller bundle (--onedir): _MEIPASS is the dist folder next to the EXE.
     # User-writable data lives in %APPDATA%\CardLens\ so it survives
     # reinstalls and works even when the app is installed under Program Files.
-    _MEIPASS_DIR: Path | None = Path(getattr(sys, "_MEIPASS"))
     _BASE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CardLens"
 else:
-    _MEIPASS_DIR = None
     _BASE = Path(__file__).resolve().parents[3]
 
 # Public path constants — identical names in dev and frozen mode so every

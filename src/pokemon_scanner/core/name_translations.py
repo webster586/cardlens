@@ -271,3 +271,15 @@ def translate_to_de(en_name: str) -> str | None:
     Comparison is case-insensitive.
     """
     return _EN_TO_DE.get(en_name.lower().strip())
+
+
+def find_en_names_for_de_partial(de_partial: str) -> list[str]:
+    """Return all English names whose German name contains de_partial as a substring.
+
+    E.g. "schigg" matches "schiggy" → ["squirtle"].
+    Comparison is case-insensitive.
+    """
+    needle = de_partial.lower().strip()
+    if not needle:
+        return []
+    return [en for de, en in _DE_TO_EN.items() if needle in de]

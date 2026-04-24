@@ -2301,6 +2301,9 @@ class _TopPerformerWidget(QWidget):
         self._visible_count = 0
         self._loaded = False
         self._owned_lookup: dict = {}
+        self._sort_col: str | None = None
+        self._sort_asc: bool = True
+        self._hdr_buttons: dict[str, QPushButton] = {}
 
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(6, 6, 6, 6)
@@ -2370,27 +2373,43 @@ class _TopPerformerWidget(QWidget):
         hdr.setFixedHeight(28)
         hdr.setStyleSheet(
             "QFrame{background:#2c3e50;border-radius:4px;}"
+            "QFrame QPushButton{border:none;background:transparent;"
+            "color:white;font-weight:bold;font-size:10px;padding:0px;}"
+            "QFrame QPushButton:hover{color:#93c5fd;}"
             "QFrame QLabel{border:none;background:transparent;"
             "color:white;font-weight:bold;font-size:10px;}"
         )
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(6, 0, 6, 0)
         hl.setSpacing(6)
-        for txt, w in [
-            ("Rang", 36), ("Bild", 56), ("Name / Nr.", 0),
-            ("Set", 150), ("Jahr", 40), ("Lang", 34), ("Preis", 75),
-            ("\u00d8/Jahr\u2191", 80), ("\u2714", 20),
-        ]:
-            lbl_h = QLabel(txt)
-            if w:
-                lbl_h.setFixedWidth(w)
+        # (display_text, fixed_width_or_0, sort_key_or_None, left_align)
+        _HDR_COLS = [
+            ("Rang",         36,  "rang",  False),
+            ("Bild",         56,  None,    False),
+            ("Name / Nr.",   0,   "name",  True),
+            ("Set",          150, "set",   True),
+            ("Jahr",         40,  "year",  False),
+            ("Lang",         34,  "lang",  False),
+            ("Preis",        75,  "price", False),
+            ("\u00d8/Jahr",  80,  "score", False),
+            ("\u2714",       20,  None,    False),
+        ]
+        for txt, w, sort_key, left in _HDR_COLS:
+            if sort_key is not None:
+                widget: QWidget = QPushButton(txt)
+                widget.setCursor(Qt.PointingHandCursor)
+                widget.clicked.connect(lambda checked=False, k=sort_key: self._sort_by(k))
+                self._hdr_buttons[sort_key] = widget  # type: ignore[index]
             else:
-                lbl_h.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            lbl_h.setAlignment(
-                Qt.AlignLeft | Qt.AlignVCenter
-                if txt in ("Name / Nr.", "Set") else Qt.AlignCenter
-            )
-            hl.addWidget(lbl_h)
+                widget = QLabel(txt)
+                widget.setAlignment(
+                    Qt.AlignLeft | Qt.AlignVCenter if left else Qt.AlignCenter
+                )
+            if w:
+                widget.setFixedWidth(w)
+            else:
+                widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            hl.addWidget(widget)
         vbox.addWidget(hdr)
 
         # Scroll area
@@ -2455,7 +2474,13 @@ class _TopPerformerWidget(QWidget):
 
     def _on_data_loaded(self, rows: list) -> None:
         self._loaded = True
+        # Stamp original rank so we can restore it after re-sorting
+        for i, r in enumerate(rows):
+            r["_orig_rank"] = i
         self._all_rows = rows
+        self._sort_col = None
+        self._sort_asc = True
+        self._update_hdr_buttons()
         self._load_btn.setEnabled(True)
         self._owned_lookup = self._col_repo.get_owned_lookup()
         if not rows:
@@ -2495,6 +2520,64 @@ class _TopPerformerWidget(QWidget):
             item = self._rows_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+
+    # ------------------------------------------------------------------
+    # Sorting
+    # ------------------------------------------------------------------
+    _SORT_KEY_FNS: dict = {
+        "rang":  lambda r: r.get("_orig_rank", 0),
+        "name":  lambda r: (r.get("name") or "").lower(),
+        "set":   lambda r: (r.get("set_name") or "").lower(),
+        "year":  lambda r: (r.get("set_release_date") or "")[:4],
+        "lang":  lambda r: (r.get("language") or "").lower(),
+        "price": lambda r: r.get("best_price") or 0.0,
+        "score": lambda r: r.get("score") or 0.0,
+    }
+
+    def _sort_by(self, col_key: str) -> None:
+        if not self._all_rows:
+            return
+        if self._sort_col == col_key:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col_key
+            # Numeric columns default to descending; text to ascending
+            self._sort_asc = col_key in ("rang", "name", "set", "lang")
+        key_fn = self._SORT_KEY_FNS.get(col_key)
+        if key_fn is None:
+            return
+        prev_visible = self._visible_count
+        self._all_rows.sort(key=key_fn, reverse=not self._sort_asc)
+        self._clear_rows()
+        self._visible_count = 0
+        # Re-render the same number of rows that were shown before
+        end = min(prev_visible, len(self._all_rows))
+        insert_pos = self._rows_layout.count() - 1
+        for i in range(end):
+            entry = self._all_rows[i]
+            owned = bool(self._owned_lookup.get(entry.get("api_id") or ""))
+            row = _TopRow(i + 1, entry, owned)
+            row.selected.connect(self._on_row_selected)
+            self._rows_layout.insertWidget(insert_pos + i, row)
+        self._visible_count = end
+        self._update_hdr_buttons()
+
+    def _update_hdr_buttons(self) -> None:
+        for key, btn in self._hdr_buttons.items():
+            labels = {
+                "rang": "Rang", "name": "Name / Nr.", "set": "Set",
+                "year": "Jahr", "lang": "Lang", "price": "Preis",
+                "score": "\u00d8/Jahr",
+            }
+            base = labels.get(key, key)
+            if self._sort_col == key:
+                arrow = " ↑" if self._sort_asc else " ↓"
+                btn.setText(base + arrow)
+                btn.setStyleSheet("color:#93c5fd;font-weight:bold;")
+            else:
+                btn.setText(base)
+                btn.setStyleSheet("")
+
 
     def _on_row_selected(self, entry: dict) -> None:
         api_id = entry.get("api_id") or ""
@@ -2602,42 +2685,19 @@ class CatalogWidget(QWidget):
         self._search_input.textChanged.connect(lambda _: self._search_timer.start())
         self._count_label = QLabel()
         self._count_label.setStyleSheet("color: #555; padding-left: 8px;")
-        btn_r = QPushButton("Aktualisieren")
-        btn_r.setMinimumHeight(34)
-        btn_r.clicked.connect(lambda: self._load_katalog(self._search_input.text().strip()))
-        self._kat_price_btn = QPushButton("\U0001f4b0 Preise updaten")
-        self._kat_price_btn.setMinimumHeight(34)
-        self._kat_price_btn.setToolTip("Preise aller Katalog-Karten via pokemontcg.io aktualisieren")
+        # Hidden state-holder widgets — keep all method bodies unchanged, just not shown in toolbar
+        self._kat_price_btn = QPushButton()
         self._kat_price_btn.clicked.connect(self._start_catalog_price_update)
         self._kat_bulk_btn = QPushButton("\u2b07 Alle Karten laden")
-        self._kat_bulk_btn.setMinimumHeight(34)
-        self._kat_bulk_btn.setToolTip(
-            "Lädt alle ~18 000 Karten von pokemontcg.io in die lokale Datenbank.\n"
-            "Nur beim ersten Start / nach einem Reset nötig."
-        )
         self._kat_bulk_btn.clicked.connect(self._start_bulk_download)
-        self._kat_img_cb = QCheckBox("\U0001f4f7 Bilder")
-        self._kat_img_cb.setToolTip("Auch Kartenbilder herunterladen (Phase 2 nach Metadaten)")
+        self._kat_img_cb = QCheckBox()
         self._kat_img_cb.setChecked(False)
         self._kat_img_size = QComboBox()
         self._kat_img_size.addItems(["small (~20 KB)", "large (~100 KB)", "beide"])
-        self._kat_img_size.setFixedWidth(130)
-        self._kat_img_size.setToolTip("Bildgröße für den Download")
-        self._kat_img_size.setEnabled(False)
         self._kat_img_cb.toggled.connect(self._kat_img_size.setEnabled)
-        btn_keys = QPushButton("\U0001f511 TCGPlayer Key")
-        btn_keys.setMinimumHeight(34)
-        btn_keys.setToolTip("TCGPlayer API-Keys f\u00fcr ETB/Bundle-Preise eintragen")
-        btn_keys.clicked.connect(self._open_api_key_dialog)
         sr.addWidget(QLabel("Suche:"))
         sr.addWidget(self._search_input, 1)
         sr.addWidget(self._count_label)
-        sr.addWidget(btn_keys)
-        sr.addWidget(self._kat_price_btn)
-        sr.addWidget(self._kat_bulk_btn)
-        sr.addWidget(self._kat_img_cb)
-        sr.addWidget(self._kat_img_size)
-        sr.addWidget(btn_r)
         kat_layout.addLayout(sr)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)

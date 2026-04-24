@@ -5,18 +5,16 @@ from typing import Any
 
 from src.pokemon_scanner.db.database import Database
 
-# Skip PRAGMA table_info once a table has been migrated in this process lifetime
-_schema_checked: set[str] = set()
-
 
 class CollectionRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._schema_initialized: bool = False
         self._migrate()
 
     def _migrate(self) -> None:
         """Add api_id column if it doesn't exist yet, then backfill from card_catalog."""
-        if "collection_entries" in _schema_checked:
+        if self._schema_initialized:
             return
         with self.database.connect() as conn:
             cols = [row[1] for row in conn.execute("PRAGMA table_info(collection_entries)").fetchall()]
@@ -34,6 +32,14 @@ class CollectionRepository:
                 conn.execute(
                     "UPDATE collection_entries SET finish = 'holo' WHERE is_foil = 1 AND (finish IS NULL OR finish = '')"
                 )
+            if "sale_status" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_status TEXT")
+            if "sale_price" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_price REAL")
+            if "sale_listed_at" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_listed_at TEXT")
+            if "sale_sold_at" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_sold_at TEXT")
             # Backfill api_id for existing rows that are missing it, by matching
             # name + set_name + card_number against card_catalog (same DB file).
             catalog_exists = conn.execute(
@@ -55,8 +61,31 @@ class CollectionRepository:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_ce_api_id ON collection_entries(api_id)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sale_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    collection_entry_id INTEGER NOT NULL,
+                    api_id TEXT,
+                    name TEXT NOT NULL,
+                    set_name TEXT,
+                    card_number TEXT,
+                    language TEXT,
+                    condition TEXT,
+                    standort TEXT,
+                    image_path TEXT,
+                    sale_price REAL,
+                    shipping_cost REAL,
+                    platform TEXT,
+                    buyer_note TEXT,
+                    purchase_price REAL,
+                    market_price_at_sale REAL,
+                    sale_listed_at TEXT,
+                    sale_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
             conn.commit()
-        _schema_checked.add("collection_entries")
+        self._schema_initialized = True
 
     def upsert_by_identity(
         self,
@@ -336,6 +365,12 @@ class CollectionRepository:
             conn.execute("DELETE FROM collection_entries WHERE id = ?", (entry_id,))
             conn.commit()
 
+    def clear_image_paths(self) -> None:
+        """Clear the image_path column for all entries (e.g. after deleting scan photos)."""
+        with self.database.connect() as conn:
+            conn.execute("UPDATE collection_entries SET image_path = NULL WHERE image_path IS NOT NULL")
+            conn.commit()
+
     def clear_collection(self) -> None:
         """Delete every entry from the collection (factory reset). Catalog is untouched."""
         with self.database.connect() as conn:
@@ -468,15 +503,130 @@ class CollectionRepository:
             conn.commit()
 
 
+    # ------------------------------------------------------------------
+    # Market / Verkauf
+    # ------------------------------------------------------------------
+
+    def set_for_sale(self, entry_id: int, price: float) -> None:
+        """Mark an entry as for-sale with the given asking price."""
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET sale_status='for_sale', sale_price=?, "
+                "sale_listed_at=?, updated_at=? WHERE id=?",
+                (price, now, now, entry_id),
+            )
+            conn.commit()
+
+    def mark_sold(self, entry_id: int) -> None:
+        """Transition an entry from for_sale → sold and record the sale in sale_history."""
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT ce.*, a.name AS standort "
+                "FROM collection_entries ce "
+                "LEFT JOIN album_slots sl ON sl.collection_entry_id = ce.id "
+                "LEFT JOIN albums a ON a.id = sl.album_id "
+                "WHERE ce.id = ? LIMIT 1",
+                (entry_id,),
+            ).fetchone()
+            if row:
+                r = dict(row)
+                conn.execute(
+                    """
+                    INSERT INTO sale_history
+                        (collection_entry_id, api_id, name, set_name, card_number, language,
+                         condition, standort, image_path, sale_price, shipping_cost, platform,
+                         buyer_note, purchase_price, market_price_at_sale, sale_listed_at,
+                         sale_date, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry_id,
+                        r.get("api_id"),
+                        r.get("name") or "",
+                        r.get("set_name"),
+                        r.get("card_number"),
+                        r.get("language"),
+                        r.get("condition"),
+                        r.get("standort"),
+                        r.get("image_path"),
+                        r.get("sale_price"),
+                        r.get("purchase_price"),
+                        r.get("last_price"),
+                        r.get("sale_listed_at"),
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE collection_entries SET sale_status='sold', sale_sold_at=?, "
+                "updated_at=? WHERE id=?",
+                (now, now, entry_id),
+            )
+            conn.commit()
+
+    def remove_listing(self, entry_id: int) -> None:
+        """Cancel a for-sale listing, clearing all sale fields."""
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET sale_status=NULL, sale_price=NULL, "
+                "sale_listed_at=NULL, updated_at=? WHERE id=?",
+                (now, entry_id),
+            )
+            conn.commit()
+
+    def list_all_for_market(self) -> list[dict]:
+        """Return all collection entries with sale columns and album location, ordered by name."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT ce.id, ce.api_id, ce.name, ce.set_name, ce.card_number, ce.language, "
+                "ce.condition, ce.quantity, ce.last_price, ce.price_currency, ce.purchase_price, "
+                "ce.image_path, ce.sale_status, ce.sale_price, ce.sale_listed_at, ce.sale_sold_at, "
+                "a.name AS standort "
+                "FROM collection_entries ce "
+                "LEFT JOIN album_slots sl ON sl.collection_entry_id = ce.id "
+                "LEFT JOIN albums a ON a.id = sl.album_id "
+                "ORDER BY ce.name ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_sold_history(self) -> list[dict]:
+        """Return all entries from sale_history, most-recently-sold first."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sale_history ORDER BY sale_date DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_sale_history_entry(
+        self,
+        history_id: int,
+        *,
+        shipping_cost: float | None,
+        platform: str | None,
+        buyer_note: str | None,
+    ) -> None:
+        """Update optional sale details (shipping, platform, buyer note) in sale_history."""
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE sale_history SET shipping_cost=?, platform=?, buyer_note=? WHERE id=?",
+                (shipping_cost, platform or None, buyer_note or None, history_id),
+            )
+            conn.commit()
+
+
 class AlbumRepository:
     """Manages physical binder albums: albums, pages, and card slots."""
 
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._schema_initialized: bool = False
         self._migrate()
 
     def _migrate(self) -> None:
-        if "albums" in _schema_checked:
+        if self._schema_initialized:
             return
         with self.database.connect() as conn:
             conn.execute("""
@@ -507,7 +657,7 @@ class AlbumRepository:
                 "CREATE INDEX IF NOT EXISTS ix_album_slots_entry ON album_slots(collection_entry_id)"
             )
             conn.commit()
-        _schema_checked.add("albums")
+        self._schema_initialized = True
 
     def create_album(self, name: str, cols: int = 3, rows: int = 3) -> int:
         now = dt.datetime.utcnow().isoformat()
@@ -757,10 +907,11 @@ class OcrCorrectionRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
         self._text_cache: dict[str, dict] | None = None  # in-memory top-500 corrections
+        self._schema_initialized: bool = False
         self._migrate()
 
     def _migrate(self) -> None:
-        if "ocr_corrections" in _schema_checked:
+        if self._schema_initialized:
             return
         with self.database.connect() as conn:
             conn.execute(
@@ -789,7 +940,7 @@ class OcrCorrectionRepository:
             if "correct_card_number" not in existing_cols:
                 conn.execute("ALTER TABLE ocr_corrections ADD COLUMN correct_card_number TEXT NOT NULL DEFAULT ''")
             conn.commit()
-        _schema_checked.add("ocr_corrections")
+        self._schema_initialized = True
 
     def _load_text_cache(self) -> None:
         """Populate in-memory cache of top-500 corrections by used_count."""

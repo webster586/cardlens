@@ -63,7 +63,7 @@ def _exif_rotation_angle(image_path: str) -> int:
     """Return CW rotation degrees (0/90/180/270) implied by EXIF Orientation tag."""
     try:
         img = _PilImage.open(image_path)
-        exif = img._getexif()  # type: ignore[attr-defined]
+        exif = img.getexif()
         if exif is None:
             return 0
         orient_tag = next(
@@ -234,12 +234,18 @@ class AlbumOcrWorker(QThread):
         self._cells = cells
         self._language = language
         self._zone = zone
+        # Private temp dir for this scan session — avoids collisions when
+        # multiple AlbumScanDialogs are open or a dialog is reopened quickly.
+        self._session_dir: str | None = None
 
     def run(self) -> None:
         img = cv2.imread(self._image_path)
         if img is None:
             self.finished.emit()
             return
+        # Create a fresh temp dir for this scan session
+        session_dir = tempfile.mkdtemp(prefix="cardlens_album_")
+        self._session_dir = session_dir
         total = len(self._cells)
         for idx, cell in enumerate(self._cells):
             if self.isInterruptionRequested():
@@ -252,9 +258,8 @@ class AlbumOcrWorker(QThread):
                     self.cell_done.emit(idx, [], "", "")
                     self.progress.emit(idx + 1, total)
                     continue
-                # Save crop as fallback warp image (overwritten if OCR finds the card)
-                cell_warp = str(RUNTIME_DIR / f"album_warp_{idx}.jpg")
-                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                # Cell-specific warp path inside the session dir — no global collisions
+                cell_warp = str(Path(session_dir) / f"album_warp_{idx}.jpg")
                 cv2.imwrite(cell_warp, crop)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp_path = tmp.name
@@ -276,6 +281,8 @@ class AlbumOcrWorker(QThread):
                 _LOG.warning("AlbumOcrWorker cell %d error: %s", idx, exc)
                 self.cell_done.emit(idx, [], "", "")
             self.progress.emit(idx + 1, total)
+        # session_dir intentionally kept alive — AlbumPageWidget.cleanup() deletes it
+        # once the UI is done using the emitted cell warp paths.
         self.finished.emit()
 
 
@@ -1489,11 +1496,10 @@ class AlbumPageWidget(QWidget):
                 worker.requestInterruption()
                 worker.quit()
                 worker.wait(2000)
-        # Delete per-cell warp images
-        for idx in range(len(self._tiles)):
-            p = RUNTIME_DIR / f"album_warp_{idx}.jpg"
+        # Delete the per-session warp image directory created by AlbumOcrWorker
+        if self._ocr_worker is not None and self._ocr_worker._session_dir:
             try:
-                p.unlink(missing_ok=True)
+                shutil.rmtree(self._ocr_worker._session_dir, ignore_errors=True)
             except Exception:
                 pass
         # Delete rotation temp files (only those inside RUNTIME_DIR)
@@ -1627,6 +1633,171 @@ class AlbumScanDialog(QDialog):
             msg = QMessageBox(self)
             msg.setWindowTitle("Bild entfernen")
             msg.setText(f"Soll die Datei auch vom Datentraeger geloescht werden?\n\n{image_path}")
+            btn_list_only = msg.addButton("Nur aus Liste entfernen", QMessageBox.ButtonRole.ActionRole)
+            btn_delete = msg.addButton("Datei loeschen", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = msg.addButton("Abbrechen", QMessageBox.ButtonRole.RejectRole)
+            msg.setDefaultButton(btn_list_only)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked is btn_cancel:
+                return
+            page.cleanup()
+            if clicked is btn_delete and image_path:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        self._tabs.removeTab(idx)
+        if self._tabs.count() == 0:
+            self._placeholder = QLabel(
+                "Kein Foto geladen.\n\nFoto hinzufügen → Raster prüfen → Analyse starten → Kacheln prüfen → Zur Sammlung hinzufügen"
+            )
+            self._placeholder.setAlignment(Qt.AlignCenter)
+            self._placeholder.setStyleSheet("color: #94a3b8; font-size: 13px;")
+            self._tabs.addTab(self._placeholder, "—")
+            self._has_real_tabs = False
+
+    def _bulk_add(self) -> None:
+        total_added = 0
+        for i in range(self._tabs.count()):
+            page = self._tabs.widget(i)
+            if not isinstance(page, AlbumPageWidget):
+                continue
+            album_page = page.get_page_name()
+            for candidate, condition in page.get_selected_tiles():
+                try:
+                    self._collection_service.confirm_candidate(
+                        candidate, condition=condition, album_page=album_page
+                    )
+                    total_added += 1
+                except Exception as exc:
+                    _LOG.warning("bulk_add error: %s", exc)
+        if total_added > 0:
+            self._bulk_status_lbl.setText(f"{total_added} Karte(n) hinzugefügt")
+            QMessageBox.information(
+                self,
+                "Sammlung aktualisiert",
+                f"{total_added} Karte(n) wurden zur Sammlung hinzugefügt.",
+            )
+        else:
+            self._bulk_status_lbl.setText("Keine markierten Kacheln gefunden")
+
+
+# ---------------------------------------------------------------------------
+# Embeddable widget (used as QStackedWidget page in the main window)
+# ---------------------------------------------------------------------------
+
+class AlbumScanWidget(QWidget):
+    """Same content as AlbumScanDialog but embedded as a QWidget page."""
+
+    back_requested = Signal()
+
+    def __init__(
+        self,
+        pipeline: RecognitionPipeline,
+        collection_service: CollectionService,
+        language: str = "",
+        parent: QWidget | None = None,
+        correction_repo: OcrCorrectionRepository | None = None,
+        catalog_repo: CatalogRepository | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._pipeline = pipeline
+        self._collection_service = collection_service
+        self._language = language
+        self._has_real_tabs = False
+        self._correction_repo = correction_repo
+        self._catalog_repo = catalog_repo
+        self._album_page_repo = AlbumPageRepository(collection_service.repository.database)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        btn_back = QPushButton("← Zurück")
+        btn_back.setMinimumHeight(36)
+        btn_back.clicked.connect(self.back_requested)
+        top_row.addWidget(btn_back)
+        btn_add = QPushButton("📂  Foto(s) hinzufügen")
+        btn_add.setMinimumHeight(36)
+        btn_add.clicked.connect(self._add_photos)
+        top_row.addWidget(btn_add)
+        top_row.addStretch()
+        layout.addLayout(top_row)
+
+        self._tabs = QTabWidget()
+        self._tabs.setTabsClosable(True)
+        self._tabs.tabCloseRequested.connect(self._close_tab)
+        layout.addWidget(self._tabs, 1)
+
+        self._placeholder = QLabel(
+            "Kein Foto geladen.\n\nFoto hinzufügen → Raster prüfen → Analyse starten → Kacheln prüfen → Zur Sammlung hinzufügen"
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet("color: #94a3b8; font-size: 13px;")
+        self._tabs.addTab(self._placeholder, "—")
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch()
+        self._bulk_status_lbl = QLabel("")
+        self._bulk_status_lbl.setStyleSheet("color: #22c55e; font-size: 11px;")
+        bottom_row.addWidget(self._bulk_status_lbl)
+        btn_bulk = QPushButton("✅  Markierte zur Sammlung hinzufügen")
+        btn_bulk.setMinimumHeight(38)
+        btn_bulk.clicked.connect(self._bulk_add)
+        bottom_row.addWidget(btn_bulk)
+        layout.addLayout(bottom_row)
+
+    def update_language(self, language: str) -> None:
+        """Update OCR language (called by main window when language changes)."""
+        self._language = language
+
+    def _cleanup_all_pages(self) -> None:
+        for i in range(self._tabs.count()):
+            page = self._tabs.widget(i)
+            if isinstance(page, AlbumPageWidget):
+                page.cleanup()
+
+    def _add_photos(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Album-Fotos auswählen",
+            "",
+            "Bilder (*.jpg *.jpeg *.png *.bmp *.webp)",
+        )
+        for path in paths:
+            self._add_tab(path)
+
+    def _add_tab(self, image_path: str) -> None:
+        if not self._has_real_tabs:
+            self._tabs.clear()
+            self._has_real_tabs = True
+        page = AlbumPageWidget(
+            image_path, self._pipeline, self._language,
+            self._album_page_repo, self._correction_repo, self._catalog_repo,
+        )
+        name = Path(image_path).name
+        label = name if len(name) <= 22 else name[:19] + "…"
+        idx = self._tabs.addTab(page, label)
+        page.name_changed.connect(
+            lambda text, i=idx: self._tabs.setTabText(
+                self._tabs.indexOf(page),
+                text if text.strip() else Path(image_path).name[:22],
+            )
+        )
+        self._tabs.setCurrentWidget(page)
+
+    def _close_tab(self, idx: int) -> None:
+        page = self._tabs.widget(idx)
+        image_path: str | None = None
+        if isinstance(page, AlbumPageWidget):
+            image_path = page._image_path
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Bild entfernen")
+            msg.setText(
+                f"Soll die Datei auch vom Datentraeger geloescht werden?\n\n{image_path}"
+            )
             btn_list_only = msg.addButton("Nur aus Liste entfernen", QMessageBox.ButtonRole.ActionRole)
             btn_delete = msg.addButton("Datei loeschen", QMessageBox.ButtonRole.DestructiveRole)
             btn_cancel = msg.addButton("Abbrechen", QMessageBox.ButtonRole.RejectRole)

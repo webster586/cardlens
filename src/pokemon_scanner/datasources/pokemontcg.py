@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict
 
@@ -16,6 +17,7 @@ _CACHE_TTL = 120.0  # seconds — identical queries within 2 min reuse results
 _CACHE_MAX = 300    # max entries; LRU evicts oldest on overflow
 # {query_string: (timestamp, results)} — OrderedDict for O(1) LRU eviction
 _fetch_cache: OrderedDict[str, tuple[float, list[CardCandidate]]] = OrderedDict()
+_fetch_cache_lock: threading.Lock = threading.Lock()
 
 
 class PokemonTcgAdapter:
@@ -114,11 +116,12 @@ class PokemonTcgAdapter:
     def _fetch(self, q: str) -> list[CardCandidate]:
         # --- cache lookup ---
         now = time.monotonic()
-        cached = _fetch_cache.get(q)
-        if cached is not None and now - cached[0] < _CACHE_TTL:
-            _LOG.debug("Cache hit for %r", q)
-            _fetch_cache.move_to_end(q)  # LRU: mark as recently used
-            return list(cached[1])
+        with _fetch_cache_lock:
+            cached = _fetch_cache.get(q)
+            if cached is not None and now - cached[0] < _CACHE_TTL:
+                _LOG.debug("Cache hit for %r", q)
+                _fetch_cache.move_to_end(q)  # LRU: mark as recently used
+                return list(cached[1])
 
         try:
             resp = requests.get(
@@ -176,9 +179,10 @@ class PokemonTcgAdapter:
                 )
             )
         # LRU eviction: discard oldest entry when cache is at max capacity
-        if len(_fetch_cache) >= _CACHE_MAX:
-            _fetch_cache.popitem(last=False)  # remove least-recently-used
-        _fetch_cache[q] = (time.monotonic(), candidates)
+        with _fetch_cache_lock:
+            if len(_fetch_cache) >= _CACHE_MAX:
+                _fetch_cache.popitem(last=False)  # remove least-recently-used
+            _fetch_cache[q] = (time.monotonic(), candidates)
         return candidates
 
     @staticmethod

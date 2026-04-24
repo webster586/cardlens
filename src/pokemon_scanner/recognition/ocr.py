@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 
 import cv2
@@ -30,6 +31,7 @@ def _to_rgb(img: np.ndarray) -> np.ndarray:
 
 class OcrEngine:
     _readers: dict = {}  # lang_key → easyocr.Reader, lazy-loaded
+    _readers_lock: threading.Lock = threading.Lock()  # guards lazy-init of _readers
 
     # Map internal key → EasyOCR language list
     _LANG_TO_EASYOCR: dict = {
@@ -68,7 +70,11 @@ class OcrEngine:
     # Regex for card number patterns like 055/088 or SV123 (require ≥2 digits for letter prefix)
     _NUMBER_PATTERN = re.compile(r'\b(\d{1,3}/\d{1,3}|[A-Z]{1,3}\d{2,4})\b')
 
-    # frozenset of chars that appear in the CHAR_MAP for fast pre-check
+    # Splits CamelCase-merged OCR words, e.g. "UmbreonVax" → "Umbreon Vax".
+    # Requires ≥3 chars in the first component and ≥2 in the second to avoid
+    # false-splitting legitimate short sequences like "GX" or "EX".
+    _CAMEL_SPLIT_RE = re.compile(r'([A-Z][a-z]{2,})([A-Z][a-z])')
+
     _CHAR_MAP_KEYS = frozenset({
         "\u2584", "\u2580", "\u2588", "\u258c", "\u2590",
     })
@@ -308,17 +314,25 @@ class OcrEngine:
         max_h = max(item[0] for item in items)
         # Keep only the large-font blocks (= Pokémon name); skip stage labels and
         # small evolution/flavour text that may also appear in the name zone crop.
-        name_items = [(xl, t) for th, xl, t, _ in items if th >= max_h * 0.50]
+        # Split CamelCase-merged words before joining — EasyOCR sometimes merges
+        # two adjacent text regions into one block (e.g. "UmbreonVax" instead of
+        # "Umbreon Vax" when the card's VMAX graphic sits directly next to the name).
+        name_items = [(xl, self._CAMEL_SPLIT_RE.sub(r'\1 \2', t)) for th, xl, t, _ in items if th >= max_h * 0.50]
         name_items.sort(key=lambda x: x[0])  # left → right
         joined = self._reorder_name(" ".join(t for _, t in name_items)).strip()
         return joined
 
     @classmethod
     def _get_reader(cls, lang_key: str = "de_en"):
-        if lang_key not in cls._readers:
-            import easyocr
-            langs = cls._LANG_TO_EASYOCR.get(lang_key, ["de", "en"])
-            _LOG.info("Loading EasyOCR model %s \u2026", langs)
-            cls._readers[lang_key] = easyocr.Reader(langs, verbose=False)
-            _LOG.info("EasyOCR model %s loaded", langs)
+        # Fast path — no lock needed once the reader is cached
+        if lang_key in cls._readers:
+            return cls._readers[lang_key]
+        with cls._readers_lock:
+            # Double-checked: another thread may have loaded it while we waited
+            if lang_key not in cls._readers:
+                import easyocr
+                langs = cls._LANG_TO_EASYOCR.get(lang_key, ["de", "en"])
+                _LOG.info("Loading EasyOCR model %s \u2026", langs)
+                cls._readers[lang_key] = easyocr.Reader(langs, verbose=False)
+                _LOG.info("EasyOCR model %s loaded", langs)
         return cls._readers[lang_key]

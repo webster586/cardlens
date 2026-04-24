@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QRect, Qt, QSize, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -45,7 +45,8 @@ from src.pokemon_scanner.recognition.matcher import CandidateMatcher
 from src.pokemon_scanner.recognition.ocr import OcrEngine
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
 from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, DisclaimerDialog
-from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog
+from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog, AlbumScanWidget
+from src.pokemon_scanner.ui.market_widget import MarktWidget
 from src.pokemon_scanner.ui.catalog_dialog import CatalogWidget
 from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
 
@@ -58,17 +59,13 @@ def _cleanup_scan_photos(repo: "CollectionRepository") -> None:
             r["image_path"] for r in rows
             if r.get("image_path") and Path(r["image_path"]).exists()
         ]
-        if not paths_to_delete:
-            return
         for p in paths_to_delete:
             try:
                 Path(p).unlink(missing_ok=True)
             except Exception:
                 pass
-        # Clear the image_path column in DB for all rows
-        with repo.database.connect() as conn:
-            conn.execute("UPDATE collection_entries SET image_path = NULL WHERE image_path IS NOT NULL")
-            conn.commit()
+        if paths_to_delete:
+            repo.clear_image_paths()
     except Exception as exc:
         logging.getLogger(__name__).warning("Scan photo cleanup failed: %s", exc)
 
@@ -88,8 +85,8 @@ class CatalogSaveWorker(QThread):
             url_map: dict[str, str] = {}
             logo_map: dict[str, str] = {}  # set_name -> set_logo_url
             for c in self._candidates:
-                if c.notes and c.notes.startswith("ID: "):
-                    url_map[c.notes[4:].strip()] = c.image_url
+                if c.api_id:
+                    url_map[c.api_id] = c.image_url
                 if c.set_name and c.set_logo_url:
                     logo_map[c.set_name] = c.set_logo_url
             for api_id in api_ids:
@@ -207,11 +204,13 @@ class MainWindow(QMainWindow):
         self._ocr_overlay_cache: QPixmap | None = None
         self._ocr_overlay_cache_key: str = ""
 
+        self._active_cam_index: int = settings.last_camera_index
+        self._cam_state: int = 0
+
         self.setWindowTitle("CardLens")
         self.resize(1700, 900)
         self._build_ui()
         self._build_menu()
-        self._populate_camera_combo()
         self._update_zone_ui()  # restore button style if zone was previously saved
 
         # Pre-warm EasyOCR so the first real scan doesn't block the UI
@@ -225,6 +224,29 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Stop background workers before closing to prevent use-after-free."""
+        self._camera_timer.stop()
+        self._watch_timer.stop()
+        self.camera_service.close()
+        for w in list(self._image_dl_workers):
+            w.requestInterruption()
+            w.quit()
+            w.wait(1500)
+        for w in list(self._catalog_save_workers):
+            w.requestInterruption()
+            w.quit()
+            w.wait(1500)
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.requestInterruption()
+            self._scan_worker.quit()
+            self._scan_worker.wait(2000)
+        if self._manual_search_worker is not None and self._manual_search_worker.isRunning():
+            self._manual_search_worker.requestInterruption()
+            self._manual_search_worker.quit()
+            self._manual_search_worker.wait(2000)
+        super().closeEvent(event)
+
     def _auto_start_camera(self) -> None:
         if not self.camera_service.state.is_running:
             self._start_camera()
@@ -234,36 +256,132 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_menu(self) -> None:
-        """Add the Help menu to the menu bar."""
+        """Add menus to the menu bar."""
         menu_bar = self.menuBar()
 
+        # ── Scanner ───────────────────────────────────────────────────────────
+        scanner_menu = menu_bar.addMenu("&Scanner")
+
+        cam_submenu = scanner_menu.addMenu("Kamera ausw\u00e4hlen")
+        cam_group = QActionGroup(cam_submenu)
+        cam_group.setExclusive(True)
+        self._cam_actions: list[QAction] = []
+        for _ci in range(4):
+            _act_cam = cam_submenu.addAction(f"Kamera {_ci}")
+            _act_cam.setCheckable(True)
+            _act_cam.setChecked(_ci == self._active_cam_index)
+            _act_cam.triggered.connect(
+                lambda _checked, idx=_ci: self._on_cam_menu_changed(idx)
+            )
+            cam_group.addAction(_act_cam)
+            self._cam_actions.append(_act_cam)
+
+        scanner_menu.addSeparator()
+
+        self._act_usb_watch = scanner_menu.addAction("\U0001f4f1 iPhone-Watch")
+        self._act_usb_watch.setCheckable(True)
+        self._act_usb_watch.setChecked(False)
+        self._act_usb_watch.setToolTip("Ordner \u00fcberwachen: neues Foto \u2192 automatisch scannen")
+        self._act_usb_watch.triggered.connect(self._toggle_usb_watch)
+
+        scanner_menu.addSeparator()
+
+        act_cam_stop = scanner_menu.addAction("\u23f9 Kamera stoppen")
+        act_cam_stop.triggered.connect(self._stop_camera)
+
+        # ── Aktionen ─────────────────────────────────────────────────────────
+        actions_menu = menu_bar.addMenu("&Aktionen")
+
+        act_tcg = actions_menu.addAction("\U0001f511 TCGPlayer Key konfigurieren \u2026")
+        act_tcg.triggered.connect(self._catalog_widget._open_api_key_dialog)
+
+        actions_menu.addSeparator()
+
+        act_prices = actions_menu.addAction("\U0001f4b0 Preise updaten")
+        act_prices.setToolTip("Preise aller Katalog-Karten via pokemontcg.io aktualisieren")
+        act_prices.triggered.connect(self._catalog_widget._start_catalog_price_update)
+
+        act_bulk = actions_menu.addAction("\u2b07 Alle Karten laden")
+        act_bulk.setToolTip(
+            "L\u00e4dt alle ~18\u202f000 Karten von pokemontcg.io in die lokale Datenbank.\n"
+            "Nur beim ersten Start / nach einem Reset n\u00f6tig."
+        )
+        act_bulk.triggered.connect(self._catalog_widget._start_bulk_download)
+
+        actions_menu.addSeparator()
+
+        act_bilder = actions_menu.addAction("\U0001f4f7 Bilder beim Laden herunterladen")
+        act_bilder.setCheckable(True)
+        act_bilder.setChecked(False)
+        act_bilder.toggled.connect(self._catalog_widget._kat_img_cb.setChecked)
+
+        img_submenu = actions_menu.addMenu("Bildgr\u00f6\u00dfe")
+        size_group = QActionGroup(img_submenu)
+        size_group.setExclusive(True)
+        for _size_text in ["small (~20 KB)", "large (~100 KB)", "beide"]:
+            _act_size = img_submenu.addAction(_size_text)
+            _act_size.setCheckable(True)
+            _act_size.setChecked(_size_text == "small (~20 KB)")
+            _act_size.triggered.connect(
+                lambda _checked, t=_size_text: self._catalog_widget._kat_img_size.setCurrentText(t)
+            )
+            size_group.addAction(_act_size)
+
+        actions_menu.addSeparator()
+
+        act_refresh = actions_menu.addAction("\U0001f504 Katalog aktualisieren")
+        act_refresh.triggered.connect(
+            lambda: self._catalog_widget._load_katalog(
+                self._catalog_widget._search_input.text().strip()
+            )
+        )
+
+        actions_menu.addSeparator()
+
+        export_submenu = actions_menu.addMenu("\U0001f4e4 Export")
+        act_csv = export_submenu.addAction("CSV exportieren")
+        act_csv.triggered.connect(self.on_export_csv)
+        act_json = export_submenu.addAction("JSON exportieren")
+        act_json.triggered.connect(self.on_export_json)
+        act_xlsx = export_submenu.addAction("XLSX exportieren")
+        act_xlsx.triggered.connect(self.on_export_xlsx)
+
+        act_album = actions_menu.addAction("\U0001f4f7 Scan Album")
+        act_album.triggered.connect(self._nav_to_album_scan)
+
+        # ── Hilfe ─────────────────────────────────────────────────────────────
         help_menu = menu_bar.addMenu("&Hilfe")
 
-        action_api = help_menu.addAction("API-Schlüssel konfigurieren …")
+        action_api = help_menu.addAction("API-Schl\u00fcssel konfigurieren \u2026")
         action_api.triggered.connect(self._open_api_key_dialog)
 
         help_menu.addSeparator()
 
-        action_about = help_menu.addAction("Über CardLens …")
+        action_about = help_menu.addAction("\u00dcber CardLens \u2026")
         action_about.triggered.connect(self._open_about)
 
-        action_disclaimer = help_menu.addAction("Lizenzen & Disclaimer …")
+        action_disclaimer = help_menu.addAction("Lizenzen & Disclaimer \u2026")
         action_disclaimer.triggered.connect(self._open_disclaimer_readonly)
 
         help_menu.addSeparator()
 
-        action_reset = help_menu.addAction("Disclaimer zurücksetzen")
-        action_reset.setToolTip("Zeigt den Disclaimer beim nächsten Programmstart erneut an")
+        action_reset = help_menu.addAction("Disclaimer zur\u00fccksetzen")
+        action_reset.setToolTip("Zeigt den Disclaimer beim n\u00e4chsten Programmstart erneut an")
         action_reset.triggered.connect(self._reset_disclaimer)
 
     def _open_api_key_dialog(self) -> None:
-        dlg = ApiKeyDialog(current_api_key=self.settings.pokemontcg_api_key, parent=self)
+        dlg = ApiKeyDialog(
+            current_api_key=self.settings.pokemontcg_api_key,
+            start_maximized=self.settings.start_maximized,
+            parent=self,
+        )
         if dlg.exec():
             new_key = dlg.api_key
             self.settings.pokemontcg_api_key = new_key
+            self.settings.start_maximized = dlg.start_maximized
             self.settings.save()
             self.pipeline.card_adapter._api_key = new_key
-            self.status_label.setText("API-Key gespeichert.")
+            self.status_label.setText("Einstellungen gespeichert.")
 
     def _open_about(self) -> None:
         AboutDialog(parent=self).exec()
@@ -280,14 +398,25 @@ class MainWindow(QMainWindow):
     # ── Nav-button style constants ──────────────────────────────────────────
     _NAV_ACTIVE = (
         "background:#252741;color:#fff;border:none;"
-        "border-left:3px solid #5865f2;border-radius:0;"
-        "padding:10px 16px 10px 13px;"
-        "text-align:left;font-size:13px;min-height:44px;"
+        "border-left:4px solid #5865f2;border-radius:0;"
+        "padding:10px 16px 10px 12px;"
+        "text-align:left;font-size:15px;font-weight:700;min-height:52px;"
     )
     _NAV_INACTIVE = (
-        "background:transparent;color:#9ca3af;border:none;"
+        "background:transparent;color:#cbd5e1;border:none;"
         "border-radius:6px;padding:10px 16px;"
-        "text-align:left;font-size:13px;min-height:44px;"
+        "text-align:left;font-size:15px;font-weight:600;min-height:52px;"
+    )
+    _NAV_SUB_INACTIVE = (
+        "background:transparent;color:#94a3b8;border:none;"
+        "border-radius:6px;padding:7px 16px 7px 32px;"
+        "text-align:left;font-size:13px;font-weight:500;min-height:36px;"
+    )
+    _NAV_SUB_ACTIVE = (
+        "background:#1a1d35;color:#e2e8f0;border:none;"
+        "border-left:3px solid #5865f2;border-radius:0;"
+        "padding:7px 16px 7px 29px;"
+        "text-align:left;font-size:13px;font-weight:600;min-height:36px;"
     )
 
     def _build_ui(self) -> None:
@@ -340,6 +469,21 @@ class MainWindow(QMainWindow):
         scanner_page = self._build_scanner_page(root)
         self._stack.addWidget(scanner_page)
 
+        # ── Page 2: Album Scan ────────────────────────────────────────────
+        self._album_scan_widget = AlbumScanWidget(
+            self.pipeline,
+            self.collection_service,
+            language=self._active_lang,
+            correction_repo=self.correction_repo,
+            catalog_repo=self.catalog_repo,
+        )
+        self._album_scan_widget.back_requested.connect(self._nav_to_einzelkarten)
+        self._stack.addWidget(self._album_scan_widget)
+
+        # ── Page 3: Markt ───────────────────────────────────────────────
+        self._markt_widget = MarktWidget(self.collection_service.repository)
+        self._stack.addWidget(self._markt_widget)
+
         # Default: Katalog
         self._stack.setCurrentIndex(0)
 
@@ -362,11 +506,14 @@ class MainWindow(QMainWindow):
         )
         lay.addWidget(title)
 
+        self._scanner_submenu_expanded = False
+        self._markt_submenu_expanded = False
         nav_defs = [
             ("📋  Katalog",       0, 0),
             ("📷  Scanner",       1, -1),
             ("⭐  Sammlung",      0, 1),
             ("🏆  Top-Performer", 0, 2),
+            ("🏪  Markt",         3, -1),
         ]
         self._nav_buttons: list[QPushButton] = []
         for i, (label, page_idx, tab_idx) in enumerate(nav_defs):
@@ -375,6 +522,17 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, p=page_idx, t=tab_idx: self._nav_click(p, t))
             lay.addWidget(btn)
             self._nav_buttons.append(btn)
+            if page_idx == 1 and tab_idx == -1:
+                self._sub_einzelkarte_btn = QPushButton("↳  Scan Einzelkarten")
+                self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_einzelkarte_btn.clicked.connect(self._nav_to_einzelkarten)
+                self._sub_einzelkarte_btn.setVisible(False)
+                lay.addWidget(self._sub_einzelkarte_btn)
+                self._sub_album_btn = QPushButton("↳  Scan Album / Bulk")
+                self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_album_btn.clicked.connect(self._nav_to_album_scan)
+                self._sub_album_btn.setVisible(False)
+                lay.addWidget(self._sub_album_btn)
 
         lay.addStretch()
 
@@ -386,17 +544,69 @@ class MainWindow(QMainWindow):
         return sidebar
 
     def _nav_click(self, page_idx: int, tab_idx: int = -1) -> None:
-        self._stack.setCurrentIndex(page_idx)
-        if page_idx == 0 and tab_idx >= 0:
-            self._catalog_widget.show_page(tab_idx)
-        self._set_nav_active_for(page_idx, tab_idx)
+        if page_idx == 1:
+            # Scanner: toggle submenu, navigate to page 1
+            self._stack.setCurrentIndex(1)
+            self._set_nav_active_for(1, -1)
+            self._scanner_submenu_expanded = not self._scanner_submenu_expanded
+            self._sub_einzelkarte_btn.setVisible(self._scanner_submenu_expanded)
+            self._sub_album_btn.setVisible(self._scanner_submenu_expanded)
+            if self._scanner_submenu_expanded:
+                self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+            # Collapse Markt submenu
+            self._markt_submenu_expanded = False
+        elif page_idx == 3:
+            # Markt: navigate directly to page 3
+            self._stack.setCurrentIndex(3)
+            self._set_nav_active(4)  # Markt is nav_buttons[4]
+            # Collapse Scanner submenu
+            self._scanner_submenu_expanded = False
+            self._sub_einzelkarte_btn.setVisible(False)
+            self._sub_album_btn.setVisible(False)
+        else:
+            self._stack.setCurrentIndex(page_idx)
+            if page_idx == 0 and tab_idx >= 0:
+                self._catalog_widget.show_page(tab_idx)
+            self._set_nav_active_for(page_idx, tab_idx)
+            # Collapse both submenus
+            self._scanner_submenu_expanded = False
+            self._sub_einzelkarte_btn.setVisible(False)
+            self._sub_album_btn.setVisible(False)
+            self._markt_submenu_expanded = False
+
+    def _nav_to_einzelkarten(self) -> None:
+        self._stack.setCurrentIndex(1)
+        self._set_nav_active_for(1, -1)
+        self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_ACTIVE)
+        self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+
+    def _nav_to_album_scan(self) -> None:
+        self._stack.setCurrentIndex(2)
+        self._set_nav_active(1)  # highlight Scanner nav button
+        self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+        self._sub_album_btn.setStyleSheet(self._NAV_SUB_ACTIVE)
+        self._sub_einzelkarte_btn.setVisible(True)
+        self._sub_album_btn.setVisible(True)
+        self._scanner_submenu_expanded = True
+        # Sync language in case it changed since widget was created
+        self._album_scan_widget.update_language(self._active_lang)
+
+    def _nav_to_markt(self, tab: int = MarktWidget.TAB_VERKAUF) -> None:
+        self._stack.setCurrentIndex(3)
+        self._set_nav_active(4)  # Markt is nav_buttons[4]
+        self._scanner_submenu_expanded = False
+        self._sub_einzelkarte_btn.setVisible(False)
+        self._sub_album_btn.setVisible(False)
+        self._markt_submenu_expanded = False
+        self._markt_widget.show_tab(tab)
 
     def _set_nav_active(self, btn_idx: int) -> None:
         for i, btn in enumerate(self._nav_buttons):
             btn.setStyleSheet(self._NAV_ACTIVE if i == btn_idx else self._NAV_INACTIVE)
 
     def _set_nav_active_for(self, page_idx: int, tab_idx: int) -> None:
-        mapping = {(0, 0): 0, (1, -1): 1, (0, 1): 2, (0, 2): 3}
+        mapping = {(0, 0): 0, (1, -1): 1, (0, 1): 2, (0, 2): 3, (3, -1): 4}
         btn_idx = mapping.get((page_idx, tab_idx), 0)
         self._set_nav_active(btn_idx)
 
@@ -404,88 +614,96 @@ class MainWindow(QMainWindow):
         page = QWidget()
         main_layout = QVBoxLayout(page)
 
-        # --- Input row: camera controls + separator + file load ---
-        input_group = QGroupBox("Eingabe")
-        input_row = QHBoxLayout(input_group)
+        # ── Unified 3-state camera scan button (placed below image preview) ──
+        self.btn_cam_scan = QPushButton()
+        self.btn_cam_scan.setMinimumHeight(48)
+        self.btn_cam_scan.setMinimumWidth(190)
+        self.btn_cam_scan.setToolTip("Kamera starten → Karte einlegen → Jetzt scannen drücken")
+        self._set_cam_btn_state(0)
+        self.btn_cam_scan.clicked.connect(self._on_cam_scan_clicked)
 
-        input_row.addWidget(QLabel("Kamera:"))
-        self.camera_combo = QComboBox()
-        self.camera_combo.setMinimumWidth(160)
-        input_row.addWidget(self.camera_combo)
-
-        self.btn_camera_toggle = QPushButton("Kamera starten")
-        self.btn_camera_toggle.setMinimumHeight(40)
-        input_row.addWidget(self.btn_camera_toggle)
-
-        self.btn_capture_frame = QPushButton("📸 Karte scannen")
-        self.btn_capture_frame.setMinimumHeight(48)
-        self.btn_capture_frame.setMinimumWidth(160)
-        self.btn_capture_frame.setEnabled(False)
-        self.btn_capture_frame.setToolTip("Karte einlegen → Knopf drücken → Foto + Scan + Hinzufügen in einem Schritt")
-        self.btn_capture_frame.setStyleSheet(
-            "QPushButton { font-size: 15px; font-weight: bold; background-color: #2563eb; color: white; border-radius: 6px; border: none; }"
-            "QPushButton:disabled { background-color: #cbd5e1; color: #94a3b8; border: none; }"
-            "QPushButton:hover:!disabled { background-color: #1d4ed8; }"
-            "QPushButton:pressed:!disabled { background-color: #1e40af; }"
+        # ── Language dropdown (placed next to camera button, below image) ─────
+        self._lang_combo = QComboBox()
+        self._lang_combo.setMinimumHeight(36)
+        self._lang_combo.setMinimumWidth(72)
+        for _lbl, _code in [("DE", "de"), ("EN", "en"), ("JP", "ja"), ("CHI", "zh-Hant"), ("KO", "ko"), ("Alle", "")]:
+            self._lang_combo.addItem(_lbl, userData=_code)
+        for _i in range(self._lang_combo.count()):
+            if self._lang_combo.itemData(_i) == self._active_lang:
+                self._lang_combo.setCurrentIndex(_i)
+                break
+        self._lang_combo.currentIndexChanged.connect(
+            lambda _: self._set_language(self._lang_combo.currentData() or "")
         )
-        input_row.addWidget(self.btn_capture_frame)
 
-        self.btn_usb_watch = QPushButton("📱 iPhone-Watch")
-        self.btn_usb_watch.setMinimumHeight(40)
-        self.btn_usb_watch.setToolTip("Ordner überwachen: neues Foto → automatisch scannen")
-        self.btn_usb_watch.clicked.connect(self._toggle_usb_watch)
-        input_row.addWidget(self.btn_usb_watch)
-
-        sep = QLabel("  \u2014  oder  \u2014")
-        sep.setAlignment(Qt.AlignCenter)
-        sep.setStyleSheet("color: #888; padding: 0 12px;")
-        input_row.addWidget(sep)
-
-        self.btn_load_image = QPushButton("Foto / Bild laden")
-        self.btn_load_image.setMinimumHeight(40)
-        input_row.addWidget(self.btn_load_image)
-
-        # Language preset buttons
-        input_row.addSpacing(20)
-        lang_label = QLabel("Sprache:")
-        lang_label.setStyleSheet("padding-left: 8px;")
-        input_row.addWidget(lang_label)
+        # ── Hidden state-holders (internals of _start/stop_camera, _toggle_usb_watch) ──
+        self.btn_load_image = QPushButton()  # hidden; file load triggered via image_label click
+        self.btn_camera_toggle = QPushButton()
+        self.btn_capture_frame = QPushButton()
+        self.btn_capture_frame.setEnabled(False)
+        self.btn_usb_watch = QPushButton()
         self._lang_buttons: dict[str, QPushButton] = {}
-        for code, label in [("de", "DE"), ("en", "EN"), ("ja", "JP"), ("zh-Hant", "CHI"), ("ko", "KO"), ("", "Alle")]:
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setMinimumHeight(36)
-            btn.setMinimumWidth(46)
-            btn.clicked.connect(lambda checked, c=code: self._set_language(c))
-            input_row.addWidget(btn)
-            self._lang_buttons[code] = btn
-        self._refresh_lang_buttons()
 
-        input_row.addStretch()
-        main_layout.addWidget(input_group)
-
-        # --- Action row: scan + confirm + exports ---
+        # --- Action row: confirm (exports/album via Aktionen-Menü) ---
         action_row = QHBoxLayout()
-        self.btn_scan = QPushButton("Analyse starten")
-        self.btn_confirm = QPushButton("Kandidat best\u00e4tigen")
-        self.btn_export_csv = QPushButton("CSV Export")
-        self.btn_export_json = QPushButton("JSON Export")
-        self.btn_export_xlsx = QPushButton("XLSX Export")
-
-        for button in [
-            self.btn_scan,
-            self.btn_confirm,
-            self.btn_export_csv,
-            self.btn_export_json,
-            self.btn_export_xlsx,
-        ]:
-            button.setMinimumHeight(40)
-            action_row.addWidget(button)
-
-        self.btn_album_scan = QPushButton("\U0001f4f7  Scan Album")
-        self.btn_album_scan.setMinimumHeight(40)
-        self.btn_album_scan.setMinimumWidth(120)
-        action_row.addWidget(self.btn_album_scan)
+        self.btn_confirm = QPushButton("\u2705 Kandidat best\u00e4tigen")
+        self.btn_confirm.setStyleSheet(
+            "QPushButton { font-weight:bold; background:#16a34a; color:white; border-radius:6px; border:none; }"
+            "QPushButton:hover { background:#15803d; }"
+            "QPushButton:pressed { background:#166534; }"
+        )
+        self.btn_confirm.setMinimumHeight(40)
+        action_row.addWidget(self.btn_confirm)
+        # Zoom + OCR controls
+        action_row.addSpacing(16)
+        action_row.addWidget(QLabel("Zoom:"))
+        self._zoom_slider = QSlider(Qt.Horizontal)
+        self._zoom_slider.setRange(10, 50)
+        self._zoom_slider.setValue(10)
+        self._zoom_slider.setFixedWidth(80)
+        self._zoom_slider.setToolTip("Zoom 1\u00d7\u20135\u00d7 (nur im Live-Preview / Kamera-Modus)")
+        action_row.addWidget(self._zoom_slider)
+        self._zoom_label = QLabel("1.0\u00d7")
+        self._zoom_label.setMinimumWidth(34)
+        self._zoom_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        action_row.addWidget(self._zoom_label)
+        reset_zoom_btn = QPushButton("1:1")
+        reset_zoom_btn.setFixedHeight(28)
+        reset_zoom_btn.setMinimumWidth(36)
+        reset_zoom_btn.setToolTip("Zoom & Pan zur\u00fccksetzen")
+        reset_zoom_btn.setStyleSheet(
+            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 4px; }"
+        )
+        reset_zoom_btn.clicked.connect(self._reset_zoom)
+        action_row.addWidget(reset_zoom_btn)
+        self._btn_region = QPushButton("OCR-Zone")
+        self._btn_region.setFixedHeight(28)
+        self._btn_region.setMinimumWidth(76)
+        self._btn_region.setCheckable(True)
+        self._btn_region.setToolTip("Name-Region ziehen: Rechteck \u00fcber den Pok\u00e9mon-Namen ziehen \u2192 OCR-Zone speichern")
+        self._btn_region.setStyleSheet(
+            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 6px; border-radius: 4px; }"
+        )
+        self._btn_region.clicked.connect(self._toggle_region_mode)
+        action_row.addWidget(self._btn_region)
+        self._btn_clear_zone = QPushButton("Zone \u00d7")
+        self._btn_clear_zone.setFixedHeight(28)
+        self._btn_clear_zone.setMinimumWidth(60)
+        self._btn_clear_zone.setToolTip("Gespeicherte OCR-Zone l\u00f6schen (zur\u00fcck zu Standard-Bereich)")
+        self._btn_clear_zone.setStyleSheet(
+            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 6px;"
+            " background: #e74c3c; color: white; border-radius: 4px; border: none; }"
+            "QPushButton:hover { background: #c0392b; }"
+        )
+        self._btn_clear_zone.clicked.connect(self._clear_saved_zone)
+        self._btn_clear_zone.setVisible(False)
+        action_row.addWidget(self._btn_clear_zone)
+        self._zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        # Hidden — triggered via Aktionen-Menü
+        self.btn_export_csv = QPushButton()
+        self.btn_export_json = QPushButton()
+        self.btn_export_xlsx = QPushButton()
+        self.btn_album_scan = QPushButton()
         action_row.addStretch()
         main_layout.addLayout(action_row)
 
@@ -495,63 +713,28 @@ class MainWindow(QMainWindow):
 
         image_group = QGroupBox("Bild / Vorschau")
         image_layout = QVBoxLayout(image_group)
-
-        # Zoom + OCR-zone controls row
-        zoom_row = QHBoxLayout()
-        zoom_row.setSpacing(4)
-        zoom_row.addWidget(QLabel("Zoom:"))
-        self._zoom_slider = QSlider(Qt.Horizontal)
-        self._zoom_slider.setRange(10, 50)   # 1.0x – 5.0x in 0.1 steps
-        self._zoom_slider.setValue(10)
-        self._zoom_slider.setFixedWidth(80)
-        self._zoom_slider.setToolTip("Zoom 1×–5× (nur im Live-Preview / Kamera-Modus)")
-        zoom_row.addWidget(self._zoom_slider)
-        self._zoom_label = QLabel("1.0×")
-        self._zoom_label.setMinimumWidth(34)
-        self._zoom_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        zoom_row.addWidget(self._zoom_label)
-        reset_zoom_btn = QPushButton("1:1")
-        reset_zoom_btn.setFixedHeight(28)
-        reset_zoom_btn.setMinimumWidth(36)
-        reset_zoom_btn.setToolTip("Zoom & Pan zurücksetzen")
-        reset_zoom_btn.setStyleSheet(
-            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 4px; }"
-        )
-        reset_zoom_btn.clicked.connect(self._reset_zoom)
-        zoom_row.addWidget(reset_zoom_btn)
-        zoom_row.addStretch(1)
-        self._btn_region = QPushButton("OCR-Zone")
-        self._btn_region.setFixedHeight(28)
-        self._btn_region.setMinimumWidth(76)
-        self._btn_region.setCheckable(True)
-        self._btn_region.setToolTip("Name-Region ziehen: Rechteck über den Pokémon-Namen ziehen → OCR-Zone speichern")
-        self._btn_region.setStyleSheet(
-            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 6px; border-radius: 4px; }"
-        )
-        self._btn_region.clicked.connect(self._toggle_region_mode)
-        zoom_row.addWidget(self._btn_region)
-        self._btn_clear_zone = QPushButton("Zone \u00d7")
-        self._btn_clear_zone.setFixedHeight(28)
-        self._btn_clear_zone.setMinimumWidth(60)
-        self._btn_clear_zone.setToolTip("Gespeicherte OCR-Zone löschen (zurück zu Standard-Bereich)")
-        self._btn_clear_zone.setStyleSheet(
-            "QPushButton { font-size: 10px; font-weight: bold; padding: 0 6px;"
-            " background: #e74c3c; color: white; border-radius: 4px; border: none; }"
-            "QPushButton:hover { background: #c0392b; }"
-        )
-        self._btn_clear_zone.clicked.connect(self._clear_saved_zone)
-        self._btn_clear_zone.setVisible(False)
-        zoom_row.addWidget(self._btn_clear_zone)
-        image_layout.addLayout(zoom_row)
-        self._zoom_slider.valueChanged.connect(self._on_zoom_changed)
+        image_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
 
         self.image_label = QLabel("Noch kein Bild geladen")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setFixedSize(420, 560)
         self.image_label.setScaledContents(False)
-        self.image_label.setStyleSheet("border: 1px solid #666; background: #111; color: #ddd;")
+        self.image_label.setStyleSheet("border: 1px solid #666; background: #111; color: #ddd; border-radius: 4px;")
+        self.image_label.setCursor(Qt.PointingHandCursor)
         self.image_label.installEventFilter(self)
+        # Spacer matching the 40px lbl_set_logo in card_preview_group — keeps both images vertically aligned
+        _img_spacer = QLabel()
+        _img_spacer.setFixedHeight(40)
+        _img_spacer.setStyleSheet("background: transparent; border: none;")
+        image_layout.addWidget(_img_spacer)
         image_layout.addWidget(self.image_label)
+        # Camera button + language selector row directly below image
+        _cam_row = QHBoxLayout()
+        _cam_row.setContentsMargins(0, 6, 0, 0)
+        _cam_row.addWidget(self.btn_cam_scan, 1)
+        _cam_row.addSpacing(8)
+        _cam_row.addWidget(self._lang_combo)
+        image_layout.addLayout(_cam_row)
         grid.addWidget(image_group, 0, 0)
 
         # Best-match panel above candidate table
@@ -581,7 +764,7 @@ class MainWindow(QMainWindow):
 
         self.lbl_best_name = QLabel("–")
         self.lbl_best_name.setStyleSheet(
-            "font-size: 18px; font-weight: bold; color: #1a1a1a;"
+            "font-size: 18px; font-weight: bold; color: #e2e8f0;"
         )
         self.lbl_best_name.setWordWrap(True)
         best_layout.addWidget(self.lbl_best_name, 0, 0, 1, 2)
@@ -612,10 +795,13 @@ class MainWindow(QMainWindow):
 
         candidate_group = QGroupBox("Alle Kandidaten")
         candidate_layout = QVBoxLayout(candidate_group)
-        self.candidate_table = QTableWidget(0, 7)
-        self.candidate_table.setHorizontalHeaderLabels(
-            ["Quelle", "Name", "Set", "Nummer", "Sprache", "Konfidenz", "Preis"]
-        )
+        self.candidate_table = QTableWidget(0, 2)
+        self.candidate_table.setHorizontalHeaderLabels(["Bild", "Kollektion"])
+        self.candidate_table.horizontalHeader().setSectionResizeMode(0, self.candidate_table.horizontalHeader().ResizeMode.Fixed)
+        self.candidate_table.horizontalHeader().setSectionResizeMode(1, self.candidate_table.horizontalHeader().ResizeMode.Stretch)
+        self.candidate_table.setColumnWidth(0, 46)
+        self.candidate_table.verticalHeader().setDefaultSectionSize(60)
+        self.candidate_table.verticalHeader().setVisible(False)
         self.candidate_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.candidate_table.setSelectionMode(QTableWidget.SingleSelection)
         candidate_layout.addWidget(self.candidate_table)
@@ -636,11 +822,14 @@ class MainWindow(QMainWindow):
         card_preview_layout.addWidget(self.lbl_set_logo)
         self.lbl_card_image = QLabel()
         self.lbl_card_image.setAlignment(Qt.AlignCenter)
-        self.lbl_card_image.setFixedSize(420, 520)
+        self.lbl_card_image.setFixedSize(420, 560)
         self.lbl_card_image.setStyleSheet("border: 1px solid #aaa; background: #222; border-radius: 4px;")
         card_preview_layout.addWidget(self.lbl_card_image)
         grid.addWidget(card_preview_group, 0, 1)
         grid.addWidget(right_panel, 0, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
         # Floating toast notification (not in any layout — absolute positioned)
         self._toast_label = QLabel(root)
@@ -664,53 +853,80 @@ class MainWindow(QMainWindow):
         collection_layout.addWidget(self.collection_table)
 
         # Signals
-        self.btn_camera_toggle.clicked.connect(self._toggle_camera)
-        self.btn_capture_frame.clicked.connect(self._capture_and_scan)
-        self.btn_load_image.clicked.connect(self.load_image)
-        self.btn_scan.clicked.connect(self.run_scan)
         self.btn_confirm.clicked.connect(self.confirm_selected_candidate)
-        self.btn_export_csv.clicked.connect(self.on_export_csv)
-        self.btn_export_json.clicked.connect(self.on_export_json)
-        self.btn_export_xlsx.clicked.connect(self.on_export_xlsx)
         self.btn_manual_search.clicked.connect(self._run_manual_search)
         self.search_input.returnPressed.connect(self._run_manual_search)
         self.candidate_table.currentItemChanged.connect(self._on_candidate_row_changed)
         self.candidate_table.cellDoubleClicked.connect(self._on_candidate_double_clicked)
         self.candidate_table.installEventFilter(self)
         self.lbl_card_image.installEventFilter(self)
-        self.btn_album_scan.clicked.connect(self._open_album_scan)
 
         return page
 
-    def _populate_camera_combo(self) -> None:
-        self.camera_combo.clear()
-        for i in range(4):
-            self.camera_combo.addItem(f"Kamera {i}", userData=i)
-        # Restore last used camera
-        saved = self.settings.last_camera_index
-        idx = self.camera_combo.findData(saved)
-        if idx >= 0:
-            self.camera_combo.setCurrentIndex(idx)
-        self.camera_combo.currentIndexChanged.connect(self._on_camera_combo_changed)
-
-    def _on_camera_combo_changed(self) -> None:
-        self.settings.last_camera_index = self.camera_combo.currentData() or 0
+    def _on_cam_menu_changed(self, idx: int) -> None:
+        self._active_cam_index = idx
+        self.settings.last_camera_index = idx
         self.settings.save()
 
     def _set_language(self, code: str) -> None:
         self._active_lang = code
         self.settings.preferred_language = code
         self.settings.save()
-        self._refresh_lang_buttons()
+        self._album_scan_widget.update_language(code)
 
     def _refresh_lang_buttons(self) -> None:
-        for code, btn in self._lang_buttons.items():
-            btn.setChecked(code == self._active_lang)
-            btn.setStyleSheet(
-                "background-color: #3a7bd5; color: white; font-weight: bold;"
-                if code == self._active_lang
-                else ""
-            )
+        pass  # replaced by _lang_combo; kept for call-site compatibility
+
+    # ------------------------------------------------------------------
+    # Camera 3-state button helpers
+    # State 0: camera off  → "📷 Kamera starten"
+    # State 1: camera on   → "📸 Jetzt scannen"
+    # State 2: scanning    → "⏳ Scannt …" (disabled)
+    # ------------------------------------------------------------------
+
+    _CAM_BTN_STYLES = {
+        0: (
+            "QPushButton { font-size:14px; font-weight:bold; background:#374151; color:#e2e8f0;"
+            " border-radius:6px; border:none; }"
+            "QPushButton:hover { background:#4b5563; }"
+        ),
+        1: (
+            "QPushButton { font-size:14px; font-weight:bold; background:#2563eb; color:white;"
+            " border-radius:6px; border:none; }"
+            "QPushButton:hover { background:#1d4ed8; }"
+            "QPushButton:pressed { background:#1e40af; }"
+        ),
+        2: (
+            "QPushButton { font-size:14px; font-weight:bold; background:#64748b; color:#cbd5e1;"
+            " border-radius:6px; border:none; }"
+        ),
+        3: (
+            "QPushButton { font-size:14px; font-weight:bold; background:#2563eb; color:white;"
+            " border-radius:6px; border:none; }"
+            "QPushButton:hover { background:#1d4ed8; }"
+            "QPushButton:pressed { background:#1e40af; }"
+        ),
+    }
+    _CAM_BTN_LABELS = {
+        0: "\U0001f4f7 Kamera starten",
+        1: "\U0001f4f8 Jetzt scannen",
+        2: "\u23f3 Scannt \u2026",
+        3: "\U0001f4f8 Jetzt scannen",
+    }
+
+    def _set_cam_btn_state(self, state: int) -> None:
+        self._cam_state = state
+        self.btn_cam_scan.setText(self._CAM_BTN_LABELS[state])
+        self.btn_cam_scan.setStyleSheet(self._CAM_BTN_STYLES[state])
+        self.btn_cam_scan.setEnabled(state != 2)
+
+    def _on_cam_scan_clicked(self) -> None:
+        if self._cam_state == 0:
+            self._start_camera()
+        elif self._cam_state == 1:
+            self._capture_and_scan()
+        elif self._cam_state == 3:
+            self.run_scan()
 
     # ------------------------------------------------------------------
     # Camera controls
@@ -723,7 +939,7 @@ class MainWindow(QMainWindow):
             self._start_camera()
 
     def _start_camera(self) -> None:
-        idx: int = self.camera_combo.currentData()
+        idx: int = self._active_cam_index
         if not self.camera_service.open(idx):
             QMessageBox.warning(
                 self, "Kamera",
@@ -731,8 +947,8 @@ class MainWindow(QMainWindow):
                 "Bitte ein anderes Ger\u00e4t w\u00e4hlen.",
             )
             return
-        self.btn_camera_toggle.setText("Kamera stoppen")
         self.btn_capture_frame.setEnabled(True)
+        self._set_cam_btn_state(1)
         self._camera_timer.start(66)  # ~15 fps – reduces main-thread repaint load
         self.status_label.setText(f"Kamera {idx} l\u00e4uft \u2026")
         self.logger.info("Camera %d started", idx)
@@ -740,8 +956,8 @@ class MainWindow(QMainWindow):
     def _stop_camera(self) -> None:
         self._camera_timer.stop()
         self.camera_service.close()
-        self.btn_camera_toggle.setText("Kamera starten")
         self.btn_capture_frame.setEnabled(False)
+        self._set_cam_btn_state(0)
         self.image_label.clear()
         self.image_label.setText("Noch kein Bild geladen")
         self.status_label.setText("Kamera gestoppt")
@@ -903,6 +1119,8 @@ class MainWindow(QMainWindow):
         self.image_label.setPixmap(scaled)
         self.status_label.setText(f"Bild geladen: {Path(file_path).name}")
         self.logger.info("Loaded image %s", file_path)
+        self._set_cam_btn_state(3)
+        self.run_scan()
 
     # ------------------------------------------------------------------
     # Scan + collection
@@ -914,8 +1132,7 @@ class MainWindow(QMainWindow):
             return
         if self._scan_worker is not None and self._scan_worker.isRunning():
             return
-        self.btn_scan.setEnabled(False)
-        self.btn_scan.setText("Scanne \u2026")
+        self._set_cam_btn_state(2)
         self.status_label.setText("Karte wird erkannt \u2026 (erster Start l\u00e4dt OCR-Modell, kann etwas dauern)")
         self._clear_best_match()
         self._last_ocr_raw = ""
@@ -931,8 +1148,12 @@ class MainWindow(QMainWindow):
         self._scan_worker.start()
 
     def _on_scan_finished(self, candidates: list[CardCandidate], warp_path: str, raw_ocr: str = "") -> None:
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("Analyse starten")
+        if self.camera_service.state.is_running:
+            self._set_cam_btn_state(1)
+        elif self.current_image_path:
+            self._set_cam_btn_state(3)
+        else:
+            self._set_cam_btn_state(0)
         self.current_candidates = candidates
         self._last_ocr_raw = raw_ocr
         # Show warped card preview if detection succeeded
@@ -953,8 +1174,12 @@ class MainWindow(QMainWindow):
         self.logger.info("Scan finished: %d candidates for %s", len(candidates), self.current_image_path)
 
     def _on_scan_error(self, message: str) -> None:
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setText("Analyse starten")
+        if self.camera_service.state.is_running:
+            self._set_cam_btn_state(1)
+        elif self.current_image_path:
+            self._set_cam_btn_state(3)
+        else:
+            self._set_cam_btn_state(0)
         self.status_label.setText(f"Fehler beim Scan: {message}")
         self.logger.error("Scan error: %s", message)
 
@@ -1043,10 +1268,9 @@ class MainWindow(QMainWindow):
         candidate = self._with_scan_language(self.current_candidates[row])
         self.collection_service.confirm_candidate(candidate, image_path=self.current_image_path)
         # Record price snapshot for history chart
-        if candidate.best_price and candidate.notes and candidate.notes.startswith("ID: "):
-            _api_id = candidate.notes[4:].strip()
+        if candidate.best_price and candidate.api_id:
             self.catalog_repo.record_price_snapshot(
-                _api_id, candidate.best_price, candidate.price_currency or "USD"
+                candidate.api_id, candidate.best_price, candidate.price_currency or "USD"
             )
         self.status_label.setText(f"Best\u00e4tigt: {candidate.name} \u2014 im Katalog gespeichert")
         self.logger.info("Candidate confirmed: %s", candidate.name)
@@ -1103,6 +1327,9 @@ class MainWindow(QMainWindow):
             return QColor("#fef9c3")  # light yellow
         return QColor("#fee2e2")      # light red
 
+    _THUMB_W = 40
+    _THUMB_H = 56
+
     def _fill_candidate_table(self, candidates: list[CardCandidate]) -> None:
         candidates = candidates[:15]  # cap at 15 rows — extra candidates add no value in UI
         self.candidate_table.setUpdatesEnabled(False)
@@ -1110,26 +1337,25 @@ class MainWindow(QMainWindow):
         try:
             self.candidate_table.setRowCount(len(candidates))
             for row_index, candidate in enumerate(candidates):
-                conf_pct = int(candidate.confidence * 100)
-                values = [
-                    candidate.source,
-                    candidate.name,
-                    candidate.set_name,
-                    candidate.card_number,
-                    candidate.language,
-                    f"{conf_pct} %",
-                    self._price_label(candidate),
-                ]
-                conf_bg = self._conf_color(candidate.confidence)
-                for col_index, value in enumerate(values):
-                    item = QTableWidgetItem(value)
-                    if col_index == 5:  # Konfidenz column
-                        item.setBackground(conf_bg)
-                    self.candidate_table.setItem(row_index, col_index, item)
+                # Column 0: thumbnail
+                lbl = QLabel()
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setFixedSize(self._THUMB_W + 4, self._THUMB_H + 4)
+                pix = load_card_pixmap(
+                    candidate.api_id,
+                    stored_hint=candidate.image_url if candidate.image_url and not candidate.image_url.startswith("http") else None,
+                )
+                if pix and not pix.isNull():
+                    lbl.setPixmap(pix.scaled(self._THUMB_W, self._THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                else:
+                    lbl.setText("?")
+                self.candidate_table.setCellWidget(row_index, 0, lbl)
+                # Column 1: set name
+                set_item = QTableWidgetItem(candidate.set_name or "–")
+                self.candidate_table.setItem(row_index, 1, set_item)
         finally:
             self.candidate_table.blockSignals(False)
             self.candidate_table.setUpdatesEnabled(True)
-        self.candidate_table.resizeColumnsToContents()
         if candidates:
             self.candidate_table.selectRow(0)
             self._update_best_match(candidates[0])
@@ -1274,8 +1500,13 @@ class MainWindow(QMainWindow):
                 self._drag_last = None
                 if self._zoom_factor > 1.0 and self.camera_service.state.is_running:
                     self.image_label.setCursor(Qt.OpenHandCursor)
-                else:
+                elif self.camera_service.state.is_running:
                     self.image_label.setCursor(Qt.ArrowCursor)
+                else:
+                    # Camera not running: click loads an image file
+                    self.image_label.setCursor(Qt.PointingHandCursor)
+                    if event.button() == Qt.LeftButton:
+                        self.load_image()
                 return True
 
         return super().eventFilter(obj, event)
@@ -1290,7 +1521,9 @@ class MainWindow(QMainWindow):
             self.image_label.setCursor(Qt.CrossCursor)
             self.status_label.setText("Region ziehen: Rechteck über den Pokémon-Namen aufziehen")
         else:
-            self.image_label.setCursor(Qt.ArrowCursor)
+            self.image_label.setCursor(
+                Qt.ArrowCursor if self.camera_service.state.is_running else Qt.PointingHandCursor
+            )
             if self._rubber_band:
                 self._rubber_band.hide()
 
@@ -1432,6 +1665,8 @@ class MainWindow(QMainWindow):
             if isinstance(folder, tuple):
                 folder = folder[0]
             if not folder:
+                # user cancelled — uncheck menu item
+                self._act_usb_watch.setChecked(False)
                 return
             self._watch_folder = folder
 
@@ -1439,6 +1674,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ordner nicht gefunden",
                                 f"Ordner nicht erreichbar:\n{self._watch_folder}\n\nBitte anderen Ordner wählen.")
             self._watch_folder = None
+            self._act_usb_watch.setChecked(False)
             return
 
         # Snapshot existing files so we only react to NEW ones
@@ -1449,8 +1685,7 @@ class MainWindow(QMainWindow):
         self._is_watching = True
         self._fs_watcher.addPath(self._watch_folder)
         self._watch_timer.start()
-        self.btn_usb_watch.setText("📱 Watch STOP")
-        self.btn_usb_watch.setStyleSheet("background-color: #dc2626; color: white; font-weight: bold; border: none; border-radius: 6px;")
+        self._act_usb_watch.setChecked(True)
         self.status_label.setText(f"Watch aktiv: {self._watch_folder}")
         self.logger.info("USB watch started on %s", self._watch_folder)
 
@@ -1459,8 +1694,7 @@ class MainWindow(QMainWindow):
         for p in self._fs_watcher.directories():
             self._fs_watcher.removePath(p)
         self._is_watching = False
-        self.btn_usb_watch.setText("📱 iPhone-Watch")
-        self.btn_usb_watch.setStyleSheet("")
+        self._act_usb_watch.setChecked(False)
         self.status_label.setText("Watch gestoppt")
         self.logger.info("USB watch stopped")
 

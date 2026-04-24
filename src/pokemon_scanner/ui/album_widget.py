@@ -13,7 +13,7 @@ import json
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QByteArray, QEvent, QMimeData, Signal
+from PySide6.QtCore import Qt, QByteArray, QEvent, QMimeData, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QDrag, QFont, QFontMetrics, QLinearGradient,
     QPainter, QPen, QPixmap, QPixmapCache,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from src.pokemon_scanner.db.repositories import AlbumRepository, CollectionRepository
 from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
+from src.pokemon_scanner.core.name_translations import find_en_names_for_de_partial
 from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
 
 _log = logging.getLogger(__name__)
@@ -76,6 +77,10 @@ class _CardPickerDialog(QDialog):
             "QLineEdit{background:#252741;border:1px solid #334155;"
             "border-radius:4px;padding:0 8px;color:#e2e8f0;}"
         )
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._do_search)
         self._search.textChanged.connect(self._on_search_changed)
         layout.addWidget(self._search)
 
@@ -105,14 +110,23 @@ class _CardPickerDialog(QDialog):
         self._load_entries("")
 
     def _on_search_changed(self, text: str) -> None:
-        self._load_entries(text.strip())
+        self._search_timer.start()  # restarts the 200 ms window
+
+    def _do_search(self) -> None:
+        self._load_entries(self._search.text().strip())
 
     def _load_entries(self, search: str) -> None:
         with self._col_repo.database.connect() as conn:
             if search:
                 t = f"%{search.lower()}%"
+                # Also search by English names matching the German partial input
+                en_names = find_en_names_for_de_partial(search)
+                de_clauses = "".join(
+                    f"\n                       OR LOWER(c.name) LIKE ?" for _ in en_names
+                )
+                de_params = tuple(f"%{n}%" for n in en_names)
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT c.api_id, c.name, c.set_name, c.card_number, c.local_image_path,
                            COALESCE(SUM(e.quantity), 0) AS owned_qty,
                            MIN(e.id) AS entry_id
@@ -120,12 +134,12 @@ class _CardPickerDialog(QDialog):
                     LEFT JOIN collection_entries e ON e.api_id = c.api_id
                     WHERE LOWER(c.name) LIKE ?
                        OR LOWER(COALESCE(c.set_name,'')) LIKE ?
-                       OR LOWER(COALESCE(c.card_number,'')) LIKE ?
+                       OR LOWER(COALESCE(c.card_number,'')) LIKE ?{de_clauses}
                     GROUP BY c.api_id
                     ORDER BY c.set_name, CAST(c.card_number AS INTEGER), c.card_number
                     LIMIT 100
                     """,
-                    (t, t, t),
+                    (t, t, t) + de_params,
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -143,6 +157,7 @@ class _CardPickerDialog(QDialog):
         self._render([dict(r) for r in rows])
 
     def _render(self, entries: list[dict]) -> None:
+        self._inner.setUpdatesEnabled(False)
         while self._inner_layout.count() > 1:
             item = self._inner_layout.takeAt(0)
             if item.widget():
@@ -214,6 +229,8 @@ class _CardPickerDialog(QDialog):
                 lambda _ev, aid=api_id, row=entry: self._pick(aid, row)
             )
             self._inner_layout.insertWidget(self._inner_layout.count() - 1, row_frame)
+
+        self._inner.setUpdatesEnabled(True)
 
     def _pick(self, api_id: str, catalog_row: dict) -> None:
         entry_id = self._col_repo.get_or_create_entry_by_api_id(
