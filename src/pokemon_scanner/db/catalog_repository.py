@@ -13,11 +13,12 @@ from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
 from src.pokemon_scanner.datasources.base import CardCandidate
 from src.pokemon_scanner.db.database import Database
 
-# Only download images from trusted pokemontcg.io hosts
+# Only download images from trusted hosts
 _ALLOWED_IMAGE_HOSTS: frozenset[str] = frozenset({
     "images.pokemontcg.io",
     "pokemontcg.io",
     "api.pokemontcg.io",
+    "images.scrydex.com",  # scrydex.com: known Pokémon card DB; used for JP/fan sets not on pokemontcg.io
 })
 _MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 5 MB hard cap per image
 
@@ -428,6 +429,43 @@ class CatalogRepository:
                 )
             conn.commit()
 
+    def update_prices(
+        self,
+        api_id: str,
+        eur: float | None,
+        usd: float | None,
+        image_url: str | None = None,
+    ) -> None:
+        """Update eur_price, usd_price, best_price and price_currency atomically.
+
+        best_price = EUR if available, else USD.
+        Skips the update entirely if both eur and usd are None, to avoid
+        overwriting previously stored prices with NULL.
+        """
+        if eur is None and usd is None:
+            return
+        best = eur if eur is not None else usd
+        currency = "EUR" if eur is not None else "USD"
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            if image_url:
+                conn.execute(
+                    """UPDATE card_catalog
+                       SET eur_price=?, usd_price=?, best_price=?, price_currency=?,
+                           image_url=?, updated_at=?
+                       WHERE api_id=?""",
+                    (eur, usd, best, currency, image_url, now, api_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE card_catalog
+                       SET eur_price=?, usd_price=?, best_price=?, price_currency=?,
+                           updated_at=?
+                       WHERE api_id=?""",
+                    (eur, usd, best, currency, now, api_id),
+                )
+            conn.commit()
+
     def list_all(self) -> list[dict[str, Any]]:
         with self.database.connect() as conn:
             rows = conn.execute(
@@ -619,6 +657,33 @@ class CatalogRepository:
     def count(self) -> int:
         with self.database.connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM card_catalog").fetchone()[0]
+
+    def get_set_completion(self) -> list[dict[str, Any]]:
+        """Return per-set completion stats joined with owned collection entries.
+
+        Returns list of dicts with keys:
+            set_name, set_total, catalog_count, owned_count, release_date, release_year
+        Sorted by release_date DESC (newest first).
+        """
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    c.set_name,
+                    MAX(COALESCE(c.set_total, 0)) AS set_total,
+                    COUNT(DISTINCT c.api_id) AS catalog_count,
+                    COUNT(DISTINCT ce.api_id) AS owned_count,
+                    MAX(c.set_release_date) AS release_date,
+                    MAX(c.set_release_year) AS release_year,
+                    c.set_series
+                FROM card_catalog c
+                LEFT JOIN collection_entries ce ON ce.api_id = c.api_id
+                WHERE c.set_name IS NOT NULL AND c.set_name != ''
+                GROUP BY c.set_name
+                ORDER BY release_date DESC, c.set_name ASC
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def search_candidates(self, name: str, number: str = "") -> list[CardCandidate]:
         """Search local catalog by name (fuzzy LIKE) or exact card number.

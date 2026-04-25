@@ -187,9 +187,14 @@ class PokemonTcgAdapter:
 
     @staticmethod
     def _extract_eur_price(card: dict) -> float | None:
-        """Extract EUR price from Cardmarket."""
+        """Extract EUR price from Cardmarket.
+
+        Priority: trendPrice > averageSellPrice > lowPrice.
+        trendPrice reflects current market demand and is far more accurate than
+        averageSellPrice, which averages ALL past sales (incl. old/inflated ones).
+        """
         prices = card.get("cardmarket", {}).get("prices", {})
-        for key in ("averageSellPrice", "trendPrice", "lowPrice"):
+        for key in ("trendPrice", "averageSellPrice", "lowPrice"):
             p = prices.get(key)
             if p is not None:
                 return round(float(p), 2)

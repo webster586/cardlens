@@ -8,7 +8,7 @@
 ; Output: installer\Output\CardLensSetup.exe
 
 #define AppName    "CardLens"
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
 #define AppPublisher "CardLens Dev"
 #define AppURL "https://github.com/webster586/cardlens"
 #define AppExeName "CardLens.exe"

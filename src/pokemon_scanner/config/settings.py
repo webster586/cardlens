@@ -36,6 +36,17 @@ class AppSettings:
     disclaimer_accepted: bool = False
     # Start the application maximized (fullscreen). Can be toggled in settings.
     start_maximized: bool = True
+    # Base font size in pixels (10–18). Adjustable via Help → Debug-Konsole.
+    ui_font_size: int = 13
+    # Per-category font sizes (pixels, except ui_font_card_pt which is points).
+    # All independently adjustable via Debug-Konsole → Darstellung.
+    ui_font_small:   int = 11   # Secondary labels, groupbox headers, tooltips
+    ui_font_xs:      int = 10   # Progress bar, metadata
+    ui_font_tiny:    int = 9    # Hints, micro catalog labels
+    ui_font_heading: int = 15   # Section headers, card names in panels
+    ui_font_large:   int = 18   # Prices, key display values
+    ui_font_card_pt: int = 6    # Card-price paintEvent (point size)
+    ui_font_mono:    int = 11   # Log-viewer / console (Consolas)
 
     @classmethod
     def settings_file(cls) -> Path:

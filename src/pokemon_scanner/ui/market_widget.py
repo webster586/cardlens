@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
+
+if TYPE_CHECKING:
+    from src.pokemon_scanner.db.catalog_repository import CatalogRepository
 from PySide6.QtGui import QPixmap, QPixmapCache
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -81,6 +85,62 @@ class _LoadWorker(QThread):
                 self.done.emit(self._repo.list_all_for_market())
         except Exception as exc:
             _LOG.warning("MarktWidget loader error: %s", exc)
+            self.done.emit([])
+
+
+# ---------------------------------------------------------------------------
+# Catalog search worker (Kauf-Tab: sucht alle Karten im Katalog)
+# ---------------------------------------------------------------------------
+
+class _CatalogSearchWorker(QThread):
+    """Sucht im Katalog und überlagert mit Sammlung (Preisalarm, Besitz)."""
+    done = Signal(list)
+
+    def __init__(
+        self,
+        catalog_repo: "CatalogRepository",
+        collection_repo: CollectionRepository | None,
+        query: str,
+    ) -> None:
+        super().__init__()
+        self._cat = catalog_repo
+        self._coll = collection_repo
+        self._query = query
+
+    def run(self) -> None:
+        try:
+            cat_rows = self._cat.search(self._query)
+            # Build lookup: api_id → owned quantity
+            owned_counts: dict[str, int] = {}
+            # Build lookup: api_id → wish_price
+            watch_map: dict[str, float] = {}
+            if self._coll:
+                owned_counts = self._coll.get_owned_counts_by_api_id()
+                for we in self._coll.get_watch_entries():
+                    watch_map[we["api_id"]] = we["wish_price"]
+            merged: list[dict] = []
+            for cat in cat_rows:
+                api_id = cat.get("api_id") or ""
+                price = cat.get("eur_price") or cat.get("best_price")
+                currency = "EUR" if cat.get("eur_price") else (cat.get("price_currency") or "EUR")
+                owned_count = owned_counts.get(api_id, 0)
+                wish_price = watch_map.get(api_id)
+                entry: dict = {
+                    "api_id":        api_id,
+                    "name":          cat.get("name"),
+                    "set_name":      cat.get("set_name"),
+                    "card_number":   cat.get("card_number"),
+                    "language":      cat.get("language"),
+                    "last_price":    price,
+                    "price_currency": currency,
+                    "image_path":    cat.get("local_image_path"),
+                    "owned_count":   owned_count,
+                    "wish_price":    wish_price,
+                }
+                merged.append(entry)
+            self.done.emit(merged)
+        except Exception as exc:
+            _LOG.warning("CatalogSearchWorker error: %s", exc)
             self.done.emit([])
 
 
@@ -1138,23 +1198,378 @@ class _EditSaleDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Kauf tab (placeholder)
+# Kauf tab – Wunschpreis
 # ---------------------------------------------------------------------------
 
-class _KaufWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
+
+class _WishPriceDialog(QDialog):
+    """Dialog zum Setzen / Löschen eines Wunschpreises."""
+
+    def __init__(self, card_name: str, current: float | None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        vbox = QVBoxLayout(self)
-        lbl = QLabel(
-            "🛒  Kauf-Funktion\n\n"
-            "Demnächst verfügbar:\n"
-            "• Karten suchen & Marktpreise vergleichen\n"
-            "• eBay / TCGPlayer Direktlinks\n"
-            "• Wunschliste"
+        self.setWindowTitle(f"Wunschpreis – {card_name}")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        info = QLabel(
+            "Du wirst benachrichtigt, wenn der Marktpreis\n"
+            "den Wunschpreis <b>unterschreitet oder erreicht</b>."
         )
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet("color:#94a3b8;font-size:14px;")
-        vbox.addWidget(lbl)
+        info.setStyleSheet("color:#94a3b8;font-size:12px;")
+        root.addWidget(info)
+
+        self._spin = QDoubleSpinBox()
+        self._spin.setRange(0.01, 9999.99)
+        self._spin.setSingleStep(0.50)
+        self._spin.setDecimals(2)
+        self._spin.setSuffix(" €")
+        self._spin.setMinimumHeight(36)
+        self._spin.setValue(current if current is not None else 5.00)
+        root.addWidget(self._spin)
+
+        btns = QHBoxLayout()
+        btn_ok = QPushButton("✔ Setzen")
+        btn_ok.setStyleSheet(
+            "QPushButton{background:#16a34a;color:white;border:none;border-radius:6px;padding:6px 18px;}"
+            "QPushButton:hover{background:#15803d;}"
+        )
+        btn_ok.clicked.connect(self.accept)
+        btns.addWidget(btn_ok)
+
+        btn_clear = QPushButton("✕ Löschen")
+        btn_clear.setStyleSheet(
+            "QPushButton{background:#7f1d1d;color:white;border:none;border-radius:6px;padding:6px 18px;}"
+            "QPushButton:hover{background:#991b1b;}"
+        )
+        btn_clear.clicked.connect(lambda: self.done(2))  # code 2 = clear
+        btns.addWidget(btn_clear)
+        root.addLayout(btns)
+
+    def get_price(self) -> float:
+        return self._spin.value()
+
+
+class _KaufRow(QFrame):
+    wish_changed = Signal(str, object)  # api_id, wish_price | None
+
+    _BG_NORMAL = "#1a1d2e"
+    _BG_HIT    = "#0f3320"   # green when price ≤ wish
+
+    def __init__(self, entry: dict, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._entry = entry
+        self._build()
+
+    def _build(self) -> None:
+        entry = self._entry
+        hit = self._is_hit()
+        bg = self._BG_HIT if hit else self._BG_NORMAL
+        border_color = "#22c55e" if hit else "#2a3045"
+        self.setObjectName("kaufrow")
+        self.setStyleSheet(
+            f"QFrame#kaufrow{{background:{bg};border:none;border-bottom:1px solid {border_color};}}"
+            "QFrame#kaufrow QLabel{border:none;background:transparent;}"
+        )
+        self.setFixedHeight(120)
+
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(10, 6, 10, 6)
+        hl.setSpacing(10)
+
+        # ── Thumbnail with owned-count badge ─────────────────────────────
+        img_container = QWidget()
+        img_container.setFixedSize(68, 95)
+        img_container.setStyleSheet("background:transparent;")
+        img_layout = QVBoxLayout(img_container)
+        img_layout.setContentsMargins(0, 0, 0, 0)
+        img_layout.setSpacing(0)
+
+        img = QLabel()
+        img.setFixedSize(68, 95)
+        img.setAlignment(Qt.AlignCenter)
+        img.setStyleSheet("border:1px solid #2a3045;border-radius:2px;background:#131520;")
+        p = resolve_card_image(api_id=entry.get("api_id"), stored_hint=entry.get("image_path"))
+        if p:
+            pm = _px(p, 80, 112)
+            if pm:
+                img.setPixmap(pm)
+
+        # Owned-count badge (overlay, only if ≥1)
+        owned = entry.get("owned_count", 0) or 0
+        if owned >= 1:
+            badge = QLabel(str(owned))
+            badge.setParent(img)
+            badge.setFixedSize(22, 22)
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setStyleSheet(
+                "background:#1d4ed8;color:white;font-weight:bold;font-size:11px;"
+                "border-radius:11px;border:1px solid #93c5fd;"
+            )
+            badge.move(44, 0)  # top-right of the 68px image
+            badge.raise_()
+
+        hl.addWidget(img)
+
+        # ── Name + Set ────────────────────────────────────────────────────
+        name_w = QWidget()
+        name_w.setStyleSheet("background:transparent;")
+        nl = QVBoxLayout(name_w)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.setSpacing(3)
+        nm = QLabel(entry.get("name") or "–")
+        nm.setStyleSheet("font-weight:bold;font-size:14px;color:#e2e8f0;")
+        nl.addWidget(nm)
+        sub = QLabel(
+            f"{entry.get('set_name') or ''}  "
+            f"#{entry.get('card_number') or '?'}"
+        )
+        sub.setStyleSheet("font-size:12px;color:#94a3b8;")
+        nl.addWidget(sub)
+        if hit:
+            hit_lbl = QLabel("✅ Wunschpreis erreicht!")
+            hit_lbl.setStyleSheet("font-size:12px;font-weight:bold;color:#4ade80;")
+            nl.addWidget(hit_lbl)
+        hl.addWidget(name_w, 1)
+
+        # ── Price column ─────────────────────────────────────────────────
+        cur = entry.get("price_currency") or "EUR"
+        price_w = QWidget()
+        price_w.setFixedWidth(160)
+        price_w.setStyleSheet("background:transparent;")
+        pl = QVBoxLayout(price_w)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(2)
+        mkt_lbl = QLabel(f"Markt: {_price_str(entry.get('last_price'), cur)}")
+        mkt_lbl.setStyleSheet("font-size:22px;color:#ffffff;")
+        pl.addWidget(mkt_lbl)
+        wish = entry.get("wish_price")
+        wish_lbl = QLabel(
+            f"Wunsch: {_price_str(wish, cur)}" if wish is not None else "Wunsch: –"
+        )
+        wish_lbl.setStyleSheet(
+            f"font-size:13px;color:{'#4ade80' if hit else '#64748b'};"
+        )
+        pl.addWidget(wish_lbl)
+        hl.addWidget(price_w)
+
+        # ── Bell button (ALL cards) ───────────────────────────────────────
+        btn_bell = QPushButton("🔔 Wunschpreis")
+        btn_bell.setFixedSize(100, 34)
+        btn_bell.setStyleSheet(
+            "QPushButton{background:#1e40af;color:white;border:none;border-radius:6px;"
+            "font-size:11px;}"
+            "QPushButton:hover{background:#1d4ed8;}"
+        )
+        btn_bell.clicked.connect(self._open_wish_dialog)
+        hl.addWidget(btn_bell)
+
+    def _is_hit(self) -> bool:
+        mp = self._entry.get("last_price")
+        wp = self._entry.get("wish_price")
+        return mp is not None and wp is not None and mp <= wp
+
+    def _open_wish_dialog(self) -> None:
+        dlg = _WishPriceDialog(
+            card_name=self._entry.get("name") or "–",
+            current=self._entry.get("wish_price"),
+            parent=self,
+        )
+        result = dlg.exec()
+        api_id = self._entry.get("api_id") or ""
+        if not api_id:
+            return
+        if result == QDialog.Accepted:
+            self.wish_changed.emit(api_id, dlg.get_price())
+        elif result == 2:  # clear
+            self.wish_changed.emit(api_id, None)
+
+
+class _KaufWidget(QWidget):
+    """Kauf-Tab: Katalog-Suche mit DE/EN-Übersetzung und Preisalarm-Funktion."""
+
+    def __init__(
+        self,
+        repo: CollectionRepository | None = None,
+        catalog_repo: "CatalogRepository | None" = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._repo = repo
+        self._catalog_repo = catalog_repo
+        self._worker: _LoadWorker | None = None
+        self._cat_worker: _CatalogSearchWorker | None = None
+        self._all_rows: list[dict] = []
+        self._row_widgets: list[_KaufRow] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        outer = QWidget()
+        outer_l = QVBoxLayout(outer)
+        outer_l.setContentsMargins(8, 8, 8, 6)
+        outer_l.setSpacing(6)
+
+        # Toolbar
+        fb = QFrame()
+        fb.setStyleSheet(
+            "QFrame{background:#1e2030;border:1px solid #2a3045;border-radius:6px;}"
+            "QFrame QLabel{border:none;background:transparent;color:#e2e8f0;}"
+        )
+        fb.setFixedHeight(48)
+        fl = QHBoxLayout(fb)
+        fl.setContentsMargins(12, 4, 12, 4)
+        fl.setSpacing(10)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("\U0001f50d  Kartenname … (DE/EN, Enter zum Suchen)")
+        self._search.setMinimumWidth(300)
+        self._search.returnPressed.connect(self._load_search)
+        fl.addWidget(self._search)
+
+        self._cb_alerted = QCheckBox("Nur Wunschpreis-Treffer")
+        self._cb_alerted.setStyleSheet("color:#e2e8f0;")
+        self._cb_alerted.toggled.connect(self._apply_filter)
+        fl.addWidget(self._cb_alerted)
+
+        fl.addStretch()
+
+        outer_l.addWidget(fb)
+
+        # Hint label
+        hint = QLabel(
+            "🔔 Klick auf \"Wunschpreis\", um einen Zielpreis zu setzen. "
+            "Zeilen werden grün markiert, wenn der Marktpreis den Wunschpreis erreicht."
+        )
+        hint.setStyleSheet("color:#64748b;font-size:11px;padding:2px 4px;")
+        hint.setWordWrap(True)
+        outer_l.addWidget(hint)
+
+        # Scroll area
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._rows_w = QWidget()
+        self._rows_l = QVBoxLayout(self._rows_w)
+        self._rows_l.setContentsMargins(0, 0, 0, 0)
+        self._rows_l.setSpacing(0)
+        self._rows_l.addStretch(1)
+        self._scroll.setWidget(self._rows_w)
+        outer_l.addWidget(self._scroll, 1)
+
+        self._status_lbl = QLabel("Suchbegriff eingeben und Enter dr\u00fccken.")
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        self._status_lbl.setStyleSheet("color:#888;font-size:11px;")
+        outer_l.addWidget(self._status_lbl)
+
+        vbox.addWidget(outer, 1)
+
+    def load_if_needed(self) -> None:
+        if not self._all_rows:
+            self._load()
+
+    def _load(self) -> None:
+        """Lade alle Sammlungskarten (Fallback ohne Suchbegriff)."""
+        if self._repo is None:
+            return
+        if self._worker and self._worker.isRunning():
+            return
+        self._status_lbl.setText("Lade \u2026")
+        self._worker = _LoadWorker(self._repo, sold_only=False)
+        self._worker.done.connect(self._on_loaded)
+        self._worker.start()
+
+    def _load_search(self) -> None:
+        """Triggered by Enter: sucht im Katalog (DE/EN) oder lädt Sammlung."""
+        query = self._search.text().strip()
+        if not query:
+            # Empty query → show all owned cards
+            self._load()
+            return
+        if self._catalog_repo is not None:
+            # Cancel running catalog worker
+            if self._cat_worker and self._cat_worker.isRunning():
+                self._cat_worker.quit()
+                self._cat_worker.wait(1000)
+            self._status_lbl.setText("Suche \u2026")
+            self._cat_worker = _CatalogSearchWorker(
+                self._catalog_repo, self._repo, query
+            )
+            self._cat_worker.done.connect(self._on_loaded)
+            self._cat_worker.start()
+        else:
+            # No catalog repo: client-side filter on already-loaded collection data
+            self._apply_filter()
+
+    def _on_loaded(self, rows: list) -> None:
+        self._all_rows = rows
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        only_hits = self._cb_alerted.isChecked()
+        rows = self._all_rows
+        if only_hits:
+            rows = [
+                r for r in rows
+                if r.get("wish_price") is not None
+                and r.get("last_price") is not None
+                and r["last_price"] <= r["wish_price"]
+            ]
+
+        while self._rows_l.count() > 1:
+            item = self._rows_l.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._row_widgets = []
+        for i, entry in enumerate(rows):
+            row_w = _KaufRow(entry)
+            row_w.wish_changed.connect(self._on_wish_changed)
+            self._rows_l.insertWidget(i, row_w)
+            self._row_widgets.append(row_w)
+
+        hit_count = sum(
+            1 for r in rows
+            if r.get("wish_price") is not None
+            and r.get("last_price") is not None
+            and r["last_price"] <= r["wish_price"]
+        )
+        n = len(rows)
+        if n:
+            self._status_lbl.setText(
+                f"{n} Karten"
+                + (f"  •  {hit_count} Wunschpreis-Treffer" if hit_count else "")
+            )
+        else:
+            self._status_lbl.setText("Keine Einträge.")
+
+    def _on_wish_changed(self, api_id: str, wish_price: object) -> None:
+        if self._repo is None:
+            return
+        try:
+            self._repo.set_wish_price(api_id, wish_price)  # type: ignore[arg-type]
+        except Exception as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+            return
+        # Update local data and refresh
+        for r in self._all_rows:
+            if r.get("api_id") == api_id:
+                r["wish_price"] = wish_price
+        self._apply_filter()
+
+    def stop_workers(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(2000)
+        if self._cat_worker and self._cat_worker.isRunning():
+            self._cat_worker.quit()
+            self._cat_worker.wait(2000)
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1927,7 @@ class MarktWidget(QWidget):
     def __init__(
         self,
         repo: CollectionRepository,
+        catalog_repo: "CatalogRepository | None" = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1527,13 +1943,13 @@ class MarktWidget(QWidget):
         )
         vbox.addWidget(self._tabs, 1)
 
-        self._kauf_w = _KaufWidget()
+        self._kauf_w = _KaufWidget(self._repo, catalog_repo=catalog_repo)
         self._verkauf_w = _VerkaufWidget(self._repo)
         self._historie_w = _HistorieWidget(self._repo)
 
-        self._tabs.addTab(self._kauf_w, "🛒  Kauf")
-        self._tabs.addTab(self._verkauf_w, "💰  Verkauf")
-        self._tabs.addTab(self._historie_w, "📜  Historie")
+        self._tabs.addTab(self._kauf_w, "\U0001f6d2  Kauf")
+        self._tabs.addTab(self._verkauf_w, "\U0001f4b0  Verkauf")
+        self._tabs.addTab(self._historie_w, "\U0001f4dc  Historie")
 
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -1542,11 +1958,14 @@ class MarktWidget(QWidget):
         self._on_tab_changed(idx)
 
     def _on_tab_changed(self, idx: int) -> None:
-        if idx == self.TAB_VERKAUF:
+        if idx == self.TAB_KAUF:
+            self._kauf_w.load_if_needed()
+        elif idx == self.TAB_VERKAUF:
             self._verkauf_w.load_if_needed()
         elif idx == self.TAB_HISTORIE:
             self._historie_w.load_if_needed()
 
     def stop_workers(self) -> None:
+        self._kauf_w.stop_workers()
         self._verkauf_w.stop_workers()
         self._historie_w.stop_workers()

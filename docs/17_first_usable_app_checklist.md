@@ -13,4 +13,3 @@
 - [x] Kamera-Livebild (USB) mit Scan-Trigger
 - [x] Set-Logo in Karten-Vorschau
 - [x] PyInstaller-Build + RAR-Distribution
-- [ ] Installer (Inno Setup) -- erfordert Inno Setup 6

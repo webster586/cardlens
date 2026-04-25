@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import tempfile
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QRubberBand,
@@ -45,10 +46,16 @@ from src.pokemon_scanner.recognition.matcher import CandidateMatcher
 from src.pokemon_scanner.recognition.ocr import OcrEngine
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
 from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, DisclaimerDialog
+from src.pokemon_scanner.ui.debug_dialog import DebugDialog
 from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog, AlbumScanWidget
+from src.pokemon_scanner.ui.title_bar import CustomTitleBar
 from src.pokemon_scanner.ui.market_widget import MarktWidget
+from src.pokemon_scanner.ui.stats_widget import StatsWidget
 from src.pokemon_scanner.ui.catalog_dialog import CatalogWidget
 from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
+from src.pokemon_scanner.ui.styles import (
+    size_body, size_small, size_xs, size_heading, size_large,
+)
 
 
 def _cleanup_scan_photos(repo: "CollectionRepository") -> None:
@@ -194,6 +201,13 @@ class MainWindow(QMainWindow):
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(lambda _: self._poll_watch_folder())
 
+        # Scan debounce – prevents pipeline overload on rapid folder-watch events
+        self._pending_scan_path: str = ""
+        self._scan_debounce_timer = QTimer(self)
+        self._scan_debounce_timer.setSingleShot(True)
+        self._scan_debounce_timer.setInterval(400)
+        self._scan_debounce_timer.timeout.connect(self._execute_queued_scan)
+
         # Region-draw OCR state
         self._region_mode: bool = False
         self._region_start: QPoint | None = None
@@ -208,10 +222,14 @@ class MainWindow(QMainWindow):
         self._cam_state: int = 0
 
         self.setWindowTitle("CardLens")
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.resize(1700, 900)
         self._build_ui()
         self._build_menu()
         self._update_zone_ui()  # restore button style if zone was previously saved
+
+        # Cooldown timestamp for wish-price alert checks (0 = never checked).
+        self._wish_alert_last_checked: float = 0.0
 
         # Pre-warm EasyOCR so the first real scan doesn't block the UI
         self._ocr_warmup_worker = _OcrWarmupWorker(self)
@@ -223,6 +241,28 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        # Only run the wish-price check once per minute to avoid redundant DB
+        # queries every time a sub-dialog closes and returns focus to this window.
+        import time
+        if time.monotonic() - self._wish_alert_last_checked > 60.0:
+            QTimer.singleShot(800, self._check_wish_alerts)
+
+    def _check_wish_alerts(self) -> None:
+        """Show banner if any watched cards have current price ≤ wish price."""
+        import time
+        self._wish_alert_last_checked = time.monotonic()
+        try:
+            hits = self.collection_service.repository.get_triggered_watch_entries()
+        except Exception:
+            return
+        if not hits:
+            return
+        n = len(hits)
+        self._wish_banner_lbl.setText(
+            f"🔔 {n} Karte{'n' if n != 1 else ''} {'haben' if n != 1 else 'hat'} den Wunschpreis erreicht! "
+            "→ Kauf-Tab anzeigen"
+        )
+        self._wish_banner.show()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Stop background workers before closing to prevent use-after-free."""
@@ -257,7 +297,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         """Add menus to the menu bar."""
-        menu_bar = self.menuBar()
+        menu_bar = self._menu_bar
 
         # ── Scanner ───────────────────────────────────────────────────────────
         scanner_menu = menu_bar.addMenu("&Scanner")
@@ -357,6 +397,11 @@ class MainWindow(QMainWindow):
 
         help_menu.addSeparator()
 
+        action_debug = help_menu.addAction("Debug-Konsole \u2026")
+        action_debug.triggered.connect(self._open_debug_dialog)
+
+        help_menu.addSeparator()
+
         action_about = help_menu.addAction("\u00dcber CardLens \u2026")
         action_about.triggered.connect(self._open_about)
 
@@ -383,6 +428,9 @@ class MainWindow(QMainWindow):
             self.pipeline.card_adapter._api_key = new_key
             self.status_label.setText("Einstellungen gespeichert.")
 
+    def _open_debug_dialog(self) -> None:
+        DebugDialog(parent=self, settings=self.settings).exec()
+
     def _open_about(self) -> None:
         AboutDialog(parent=self).exec()
 
@@ -395,36 +443,68 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self.status_label.setText("Disclaimer zurückgesetzt — wird beim nächsten Start erneut angezeigt.")
 
-    # ── Nav-button style constants ──────────────────────────────────────────
-    _NAV_ACTIVE = (
-        "background:#252741;color:#fff;border:none;"
-        "border-left:4px solid #5865f2;border-radius:0;"
-        "padding:10px 16px 10px 12px;"
-        "text-align:left;font-size:15px;font-weight:700;min-height:52px;"
-    )
-    _NAV_INACTIVE = (
-        "background:transparent;color:#cbd5e1;border:none;"
-        "border-radius:6px;padding:10px 16px;"
-        "text-align:left;font-size:15px;font-weight:600;min-height:52px;"
-    )
-    _NAV_SUB_INACTIVE = (
-        "background:transparent;color:#94a3b8;border:none;"
-        "border-radius:6px;padding:7px 16px 7px 32px;"
-        "text-align:left;font-size:13px;font-weight:500;min-height:36px;"
-    )
-    _NAV_SUB_ACTIVE = (
-        "background:#1a1d35;color:#e2e8f0;border:none;"
-        "border-left:3px solid #5865f2;border-radius:0;"
-        "padding:7px 16px 7px 29px;"
-        "text-align:left;font-size:13px;font-weight:600;min-height:36px;"
-    )
+    # ── Nav-button style helpers ────────────────────────────────────────────
+    # These are methods (not class constants) so they always use the current
+    # font-size category values, making refresh_font_sizes() possible.
+
+    def _nav_active_style(self) -> str:
+        return (
+            f"background:#252741;color:#fff;border:none;"
+            f"border-left:4px solid #5865f2;border-radius:0;"
+            f"padding:10px 16px 10px 12px;"
+            f"text-align:left;font-size:{size_heading()}px;font-weight:700;min-height:52px;"
+        )
+
+    def _nav_inactive_style(self) -> str:
+        return (
+            f"background:transparent;color:#cbd5e1;border:none;"
+            f"border-radius:6px;padding:10px 16px;"
+            f"text-align:left;font-size:{size_heading()}px;font-weight:600;min-height:52px;"
+        )
+
+    def _nav_sub_inactive_style(self) -> str:
+        return (
+            f"background:transparent;color:#94a3b8;border:none;"
+            f"border-radius:6px;padding:7px 16px 7px 32px;"
+            f"text-align:left;font-size:{size_body()}px;font-weight:500;min-height:36px;"
+        )
+
+    def _nav_sub_active_style(self) -> str:
+        return (
+            f"background:#1a1d35;color:#e2e8f0;border:none;"
+            f"border-left:3px solid #5865f2;border-radius:0;"
+            f"padding:7px 16px 7px 29px;"
+            f"text-align:left;font-size:{size_body()}px;font-weight:600;min-height:36px;"
+        )
 
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        outer = QHBoxLayout(root)
+        # Suppress QMainWindow's native menu-bar slot (we embed our own below)
+        self.menuBar().setVisible(False)
+
+        # ── Outer VBox: title bar → menu bar → content ────────────────────
+        outer_v = QVBoxLayout(root)
+        outer_v.setContentsMargins(0, 0, 0, 0)
+        outer_v.setSpacing(0)
+
+        # 1. Custom title bar at very top
+        self._title_bar = CustomTitleBar(root)
+        self._title_bar.btn_min.clicked.connect(self.showMinimized)
+        self._title_bar.btn_max.clicked.connect(self._toggle_maximize)
+        self._title_bar.btn_close.clicked.connect(self.close)
+        self._title_bar.double_clicked.connect(self._toggle_maximize)
+        outer_v.addWidget(self._title_bar)
+
+        # 2. Standalone menu bar (not managed by QMainWindow)
+        self._menu_bar = QMenuBar(root)
+        outer_v.addWidget(self._menu_bar)
+
+        inner = QWidget()
+        outer = QHBoxLayout(inner)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        outer_v.addWidget(inner, 1)
 
         # ── Left sidebar ──────────────────────────────────────────────────
         sidebar = self._build_sidebar()
@@ -444,13 +524,38 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
 
+        # ── Wunschpreis-Banner (hidden until triggered at startup) ────────
+        self._wish_banner = QFrame()
+        self._wish_banner.setFixedHeight(44)
+        self._wish_banner.setStyleSheet(
+            "QFrame{background:#14532d;border-bottom:1px solid #22c55e;}"
+            f"QFrame QLabel{{color:#4ade80;font-size:{size_body()}px;font-weight:bold;"
+            "background:transparent;border:none;}"
+            f"QFrame QPushButton{{background:transparent;border:none;"
+            f"color:#86efac;font-size:{size_large()}px;padding:0 4px;}}"
+            "QFrame QPushButton:hover{color:white;}"
+        )
+        _bhl = QHBoxLayout(self._wish_banner)
+        _bhl.setContentsMargins(14, 0, 8, 0)
+        _bhl.setSpacing(8)
+        self._wish_banner_lbl = QLabel()
+        self._wish_banner_lbl.setCursor(Qt.PointingHandCursor)
+        self._wish_banner_lbl.mousePressEvent = lambda _e: self._nav_to_markt(MarktWidget.TAB_KAUF)
+        _bhl.addWidget(self._wish_banner_lbl, 1)
+        _btn_dismiss = QPushButton("✕")
+        _btn_dismiss.setFixedSize(24, 24)
+        _btn_dismiss.clicked.connect(self._wish_banner.hide)
+        _bhl.addWidget(_btn_dismiss)
+        self._wish_banner.hide()
+        content_layout.addWidget(self._wish_banner)
+
         self._stack = QStackedWidget()
         content_layout.addWidget(self._stack, 1)
 
         self.status_label = QLabel("Bereit")
         self.status_label.setMinimumHeight(24)
         self.status_label.setStyleSheet(
-            "color:#94a3b8;font-size:11px;padding:2px 10px;"
+            f"color:#94a3b8;font-size:{size_small()}px;padding:2px 10px;"
             "border-top:1px solid #334155;background:#151726;"
         )
         content_layout.addWidget(self.status_label)
@@ -481,11 +586,22 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._album_scan_widget)
 
         # ── Page 3: Markt ───────────────────────────────────────────────
-        self._markt_widget = MarktWidget(self.collection_service.repository)
+        self._markt_widget = MarktWidget(
+            self.collection_service.repository,
+            catalog_repo=self.catalog_repo,
+        )
         self._stack.addWidget(self._markt_widget)
+
+        # ── Page 4: Statistiken ──────────────────────────────────────────
+        self._stats_widget = StatsWidget(
+            self.collection_service.repository,
+            catalog_repo=self.catalog_repo,
+        )
+        self._stack.addWidget(self._stats_widget)
 
         # Default: Katalog
         self._stack.setCurrentIndex(0)
+        self._update_title("Katalog")
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
@@ -499,13 +615,14 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(8, 16, 8, 16)
         lay.setSpacing(4)
 
-        title = QLabel("CardLens")
-        title.setStyleSheet(
-            "color:#e2e8f0;font-size:18px;font-weight:bold;"
+        self._sidebar_title = QLabel("CardLens")
+        self._sidebar_title.setStyleSheet(
+            f"color:#e2e8f0;font-size:{size_large()}px;font-weight:bold;"
             "padding:6px 8px 14px 8px;border:none;background:transparent;"
         )
-        lay.addWidget(title)
+        lay.addWidget(self._sidebar_title)
 
+        self._active_nav_idx = 0
         self._scanner_submenu_expanded = False
         self._markt_submenu_expanded = False
         nav_defs = [
@@ -514,22 +631,23 @@ class MainWindow(QMainWindow):
             ("⭐  Sammlung",      0, 1),
             ("🏆  Top-Performer", 0, 2),
             ("🏪  Markt",         3, -1),
+            ("📊  Statistiken",   4, -1),
         ]
         self._nav_buttons: list[QPushButton] = []
         for i, (label, page_idx, tab_idx) in enumerate(nav_defs):
             btn = QPushButton(label)
-            btn.setStyleSheet(self._NAV_ACTIVE if i == 0 else self._NAV_INACTIVE)
+            btn.setStyleSheet(self._nav_active_style() if i == 0 else self._nav_inactive_style())
             btn.clicked.connect(lambda _=False, p=page_idx, t=tab_idx: self._nav_click(p, t))
             lay.addWidget(btn)
             self._nav_buttons.append(btn)
             if page_idx == 1 and tab_idx == -1:
                 self._sub_einzelkarte_btn = QPushButton("↳  Scan Einzelkarten")
-                self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_einzelkarte_btn.setStyleSheet(self._nav_sub_inactive_style())
                 self._sub_einzelkarte_btn.clicked.connect(self._nav_to_einzelkarten)
                 self._sub_einzelkarte_btn.setVisible(False)
                 lay.addWidget(self._sub_einzelkarte_btn)
                 self._sub_album_btn = QPushButton("↳  Scan Album / Bulk")
-                self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_album_btn.setStyleSheet(self._nav_sub_inactive_style())
                 self._sub_album_btn.clicked.connect(self._nav_to_album_scan)
                 self._sub_album_btn.setVisible(False)
                 lay.addWidget(self._sub_album_btn)
@@ -537,7 +655,7 @@ class MainWindow(QMainWindow):
         lay.addStretch()
 
         btn_settings = QPushButton("⚙  Einstellungen")
-        btn_settings.setStyleSheet(self._NAV_INACTIVE)
+        btn_settings.setStyleSheet(self._nav_inactive_style())
         btn_settings.clicked.connect(self._open_api_key_dialog)
         lay.addWidget(btn_settings)
 
@@ -552,8 +670,8 @@ class MainWindow(QMainWindow):
             self._sub_einzelkarte_btn.setVisible(self._scanner_submenu_expanded)
             self._sub_album_btn.setVisible(self._scanner_submenu_expanded)
             if self._scanner_submenu_expanded:
-                self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
-                self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+                self._sub_einzelkarte_btn.setStyleSheet(self._nav_sub_inactive_style())
+                self._sub_album_btn.setStyleSheet(self._nav_sub_inactive_style())
             # Collapse Markt submenu
             self._markt_submenu_expanded = False
         elif page_idx == 3:
@@ -564,6 +682,14 @@ class MainWindow(QMainWindow):
             self._scanner_submenu_expanded = False
             self._sub_einzelkarte_btn.setVisible(False)
             self._sub_album_btn.setVisible(False)
+        elif page_idx == 4:
+            # Statistiken
+            self._stack.setCurrentIndex(4)
+            self._set_nav_active(5)  # Statistiken is nav_buttons[5]
+            self._scanner_submenu_expanded = False
+            self._sub_einzelkarte_btn.setVisible(False)
+            self._sub_album_btn.setVisible(False)
+            self._markt_submenu_expanded = False
         else:
             self._stack.setCurrentIndex(page_idx)
             if page_idx == 0 and tab_idx >= 0:
@@ -574,23 +700,31 @@ class MainWindow(QMainWindow):
             self._sub_einzelkarte_btn.setVisible(False)
             self._sub_album_btn.setVisible(False)
             self._markt_submenu_expanded = False
+        _title_map = {
+            (0, -1): "Katalog", (0, 0): "Katalog",
+            (0, 1): "Sammlung", (0, 2): "Top-Performer",
+            (1, -1): "Scanner", (3, -1): "Markt", (4, -1): "Statistiken",
+        }
+        self._update_title(_title_map.get((page_idx, tab_idx), "CardLens"))
 
     def _nav_to_einzelkarten(self) -> None:
         self._stack.setCurrentIndex(1)
         self._set_nav_active_for(1, -1)
-        self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_ACTIVE)
-        self._sub_album_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
+        self._sub_einzelkarte_btn.setStyleSheet(self._nav_sub_active_style())
+        self._sub_album_btn.setStyleSheet(self._nav_sub_inactive_style())
+        self._update_title("Scanner")
 
     def _nav_to_album_scan(self) -> None:
         self._stack.setCurrentIndex(2)
         self._set_nav_active(1)  # highlight Scanner nav button
-        self._sub_einzelkarte_btn.setStyleSheet(self._NAV_SUB_INACTIVE)
-        self._sub_album_btn.setStyleSheet(self._NAV_SUB_ACTIVE)
+        self._sub_einzelkarte_btn.setStyleSheet(self._nav_sub_inactive_style())
+        self._sub_album_btn.setStyleSheet(self._nav_sub_active_style())
         self._sub_einzelkarte_btn.setVisible(True)
         self._sub_album_btn.setVisible(True)
         self._scanner_submenu_expanded = True
         # Sync language in case it changed since widget was created
         self._album_scan_widget.update_language(self._active_lang)
+        self._update_title("Album Scan")
 
     def _nav_to_markt(self, tab: int = MarktWidget.TAB_VERKAUF) -> None:
         self._stack.setCurrentIndex(3)
@@ -600,15 +734,119 @@ class MainWindow(QMainWindow):
         self._sub_album_btn.setVisible(False)
         self._markt_submenu_expanded = False
         self._markt_widget.show_tab(tab)
+        self._update_title("Markt")
 
     def _set_nav_active(self, btn_idx: int) -> None:
+        self._active_nav_idx = btn_idx
         for i, btn in enumerate(self._nav_buttons):
-            btn.setStyleSheet(self._NAV_ACTIVE if i == btn_idx else self._NAV_INACTIVE)
+            btn.setStyleSheet(self._nav_active_style() if i == btn_idx else self._nav_inactive_style())
 
     def _set_nav_active_for(self, page_idx: int, tab_idx: int) -> None:
-        mapping = {(0, 0): 0, (1, -1): 1, (0, 1): 2, (0, 2): 3, (3, -1): 4}
+        mapping = {(0, 0): 0, (1, -1): 1, (0, 1): 2, (0, 2): 3, (3, -1): 4, (4, -1): 5}
         btn_idx = mapping.get((page_idx, tab_idx), 0)
         self._set_nav_active(btn_idx)
+
+    def refresh_font_sizes(self) -> None:
+        """Re-apply all inline font stylesheets that use size_*() helpers.
+
+        Called by DebugDialog after the user clicks "Anwenden" so that the
+        persistent main-window widgets pick up the new size values immediately.
+        """
+        # Sidebar title
+        if hasattr(self, "_sidebar_title"):
+            self._sidebar_title.setStyleSheet(
+                f"color:#e2e8f0;font-size:{size_large()}px;font-weight:bold;"
+                "padding:6px 8px 14px 8px;border:none;background:transparent;"
+            )
+        # Nav buttons
+        if hasattr(self, "_nav_buttons"):
+            for i, btn in enumerate(self._nav_buttons):
+                is_active = i == getattr(self, "_active_nav_idx", 0)
+                btn.setStyleSheet(
+                    self._nav_active_style() if is_active else self._nav_inactive_style()
+                )
+        # Sub-nav buttons (apply inactive style; active state restored by user navigation)
+        for attr in ("_sub_einzelkarte_btn", "_sub_album_btn"):
+            if hasattr(self, attr):
+                getattr(self, attr).setStyleSheet(self._nav_sub_inactive_style())
+        # Status label
+        if hasattr(self, "status_label"):
+            cur_text = self.status_label.text()
+            self.status_label.setStyleSheet(
+                f"color:#94a3b8;font-size:{size_small()}px;padding:2px 10px;"
+                "border-top:1px solid #334155;background:#151726;"
+            )
+        # Wish banner
+        if hasattr(self, "_wish_banner"):
+            self._wish_banner.setStyleSheet(
+                "QFrame{background:#14532d;border-bottom:1px solid #22c55e;}"
+                f"QFrame QLabel{{color:#4ade80;font-size:{size_body()}px;font-weight:bold;"
+                "background:transparent;border:none;}"
+                f"QFrame QPushButton{{background:transparent;border:none;"
+                f"color:#86efac;font-size:{size_large()}px;padding:0 4px;}}"
+                "QFrame QPushButton:hover{color:white;}"
+            )
+        # Scanner panel: detected-card labels
+        if hasattr(self, "lbl_best_name"):
+            self.lbl_best_name.setStyleSheet(
+                f"font-size: {size_large()}px; font-weight: bold; color: #e2e8f0;"
+            )
+        if hasattr(self, "lbl_best_price"):
+            self.lbl_best_price.setStyleSheet(
+                f"font-size: {size_heading()}px; font-weight: bold; color: #16a34a;"
+            )
+        # Camera scan button
+        if hasattr(self, "_cam_state") and hasattr(self, "btn_cam_scan"):
+            self.btn_cam_scan.setStyleSheet(self._cam_btn_style(self._cam_state))
+
+    # ── Custom title bar helpers ──────────────────────────────────────────
+
+    def _update_title(self, section: str) -> None:
+        if hasattr(self, "_title_bar"):
+            self._title_bar.set_title(f"CardLens  –  {section}")
+
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        if event.type() == QEvent.WindowStateChange:
+            if hasattr(self, "_title_bar"):
+                self._title_bar.set_maximized(self.isMaximized())
+        super().changeEvent(event)
+
+    def nativeEvent(self, event_type, message):  # type: ignore[override]
+        """Handle resize borders for frameless window so edges/corners stay draggable."""
+        if event_type == b"windows_generic_MSG":
+            try:
+                import ctypes
+                ptr_size = ctypes.sizeof(ctypes.c_void_p)
+                msg_addr = int(message)
+                msg_id = ctypes.c_uint.from_address(msg_addr + ptr_size).value
+                if msg_id == 0x0084 and not self.isMaximized():  # WM_NCHITTEST
+                    lp_offset = 3 * ptr_size
+                    lParam = ctypes.c_ssize_t.from_address(msg_addr + lp_offset).value
+                    cx = ctypes.c_short(lParam & 0xFFFF).value
+                    cy = ctypes.c_short((lParam >> 16) & 0xFFFF).value
+                    geo = self.frameGeometry()
+                    b = 6  # resize border width in pixels
+                    in_l = cx < geo.left() + b
+                    in_r = cx >= geo.right() - b
+                    in_t = cy < geo.top() + b
+                    in_b = cy >= geo.bottom() - b
+                    if in_t and in_l:  return True, 13  # HTTOPLEFT
+                    if in_t and in_r:  return True, 14  # HTTOPRIGHT
+                    if in_b and in_l:  return True, 16  # HTBOTTOMLEFT
+                    if in_b and in_r:  return True, 17  # HTBOTTOMRIGHT
+                    if in_l:           return True, 10  # HTLEFT
+                    if in_r:           return True, 11  # HTRIGHT
+                    if in_t:           return True, 12  # HTTOP
+                    if in_b:           return True, 15  # HTBOTTOM
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
 
     def _build_scanner_page(self, root: QWidget) -> QWidget:
         page = QWidget()
@@ -758,13 +996,13 @@ class MainWindow(QMainWindow):
 
         best_group = QGroupBox("Erkannte Karte")
         best_group.setStyleSheet(
-            "QGroupBox { font-weight: bold; font-size: 13px; }"
+            f"QGroupBox {{ font-weight: bold; font-size: {size_body()}px; }}"
         )
         best_layout = QGridLayout(best_group)
 
         self.lbl_best_name = QLabel("–")
         self.lbl_best_name.setStyleSheet(
-            "font-size: 18px; font-weight: bold; color: #e2e8f0;"
+            f"font-size: {size_large()}px; font-weight: bold; color: #e2e8f0;"
         )
         self.lbl_best_name.setWordWrap(True)
         best_layout.addWidget(self.lbl_best_name, 0, 0, 1, 2)
@@ -787,7 +1025,7 @@ class MainWindow(QMainWindow):
 
         best_layout.addWidget(QLabel("Preis:"), 5, 0)
         self.lbl_best_price = QLabel("–")
-        self.lbl_best_price.setStyleSheet("font-size: 15px; font-weight: bold; color: #16a34a;")
+        self.lbl_best_price.setStyleSheet(f"font-size: {size_heading()}px; font-weight: bold; color: #16a34a;")
         best_layout.addWidget(self.lbl_best_price, 5, 1)
 
         best_layout.setColumnStretch(1, 1)
@@ -884,29 +1122,32 @@ class MainWindow(QMainWindow):
     # State 2: scanning    → "⏳ Scannt …" (disabled)
     # ------------------------------------------------------------------
 
-    _CAM_BTN_STYLES = {
-        0: (
-            "QPushButton { font-size:14px; font-weight:bold; background:#374151; color:#e2e8f0;"
-            " border-radius:6px; border:none; }"
-            "QPushButton:hover { background:#4b5563; }"
-        ),
-        1: (
-            "QPushButton { font-size:14px; font-weight:bold; background:#2563eb; color:white;"
-            " border-radius:6px; border:none; }"
-            "QPushButton:hover { background:#1d4ed8; }"
-            "QPushButton:pressed { background:#1e40af; }"
-        ),
-        2: (
-            "QPushButton { font-size:14px; font-weight:bold; background:#64748b; color:#cbd5e1;"
-            " border-radius:6px; border:none; }"
-        ),
-        3: (
-            "QPushButton { font-size:14px; font-weight:bold; background:#2563eb; color:white;"
-            " border-radius:6px; border:none; }"
-            "QPushButton:hover { background:#1d4ed8; }"
-            "QPushButton:pressed { background:#1e40af; }"
-        ),
-    }
+    def _cam_btn_style(self, state: int) -> str:
+        sz = size_heading()
+        styles = {
+            0: (
+                f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#374151; color:#e2e8f0;"
+                " border-radius:6px; border:none; }"
+                "QPushButton:hover { background:#4b5563; }"
+            ),
+            1: (
+                f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#2563eb; color:white;"
+                " border-radius:6px; border:none; }"
+                "QPushButton:hover { background:#1d4ed8; }"
+                "QPushButton:pressed { background:#1e40af; }"
+            ),
+            2: (
+                f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#64748b; color:#cbd5e1;"
+                " border-radius:6px; border:none; }"
+            ),
+            3: (
+                f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#2563eb; color:white;"
+                " border-radius:6px; border:none; }"
+                "QPushButton:hover { background:#1d4ed8; }"
+                "QPushButton:pressed { background:#1e40af; }"
+            ),
+        }
+        return styles.get(state, styles[0])
     _CAM_BTN_LABELS = {
         0: "\U0001f4f7 Kamera starten",
         1: "\U0001f4f8 Jetzt scannen",
@@ -917,7 +1158,7 @@ class MainWindow(QMainWindow):
     def _set_cam_btn_state(self, state: int) -> None:
         self._cam_state = state
         self.btn_cam_scan.setText(self._CAM_BTN_LABELS[state])
-        self.btn_cam_scan.setStyleSheet(self._CAM_BTN_STYLES[state])
+        self.btn_cam_scan.setStyleSheet(self._cam_btn_style(state))
         self.btn_cam_scan.setEnabled(state != 2)
 
     def _on_cam_scan_clicked(self) -> None:
@@ -1172,6 +1413,9 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("Keine Karte erkannt \u2013 Bild pr\u00fcfen oder erneut scannen")
         self.logger.info("Scan finished: %d candidates for %s", len(candidates), self.current_image_path)
+        # Process any scan that was queued while this one was running
+        if self._pending_scan_path:
+            self._execute_queued_scan()
 
     def _on_scan_error(self, message: str) -> None:
         if self.camera_service.state.is_running:
@@ -1182,6 +1426,37 @@ class MainWindow(QMainWindow):
             self._set_cam_btn_state(0)
         self.status_label.setText(f"Fehler beim Scan: {message}")
         self.logger.error("Scan error: %s", message)
+        if self._pending_scan_path:
+            self._execute_queued_scan()
+
+    def _queue_scan(self, path: str) -> None:
+        """Queue a folder-watch scan; debounces rapid-fire events so only the
+        most-recently-arrived file is scanned when the timer fires."""
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            self.status_label.setText(
+                f"Foto erkannt, aber Bild nicht lesbar: {Path(path).name}"
+            )
+            return
+        self._pending_scan_path = path
+        self.current_image_path = path
+        self.image_label.setPixmap(self._scale_pixmap(pixmap))
+        self.status_label.setText(
+            f"Neues Foto: {Path(path).name} \u2013 Scan startet \u2026"
+        )
+        self._scan_debounce_timer.start()  # restart resets the 400 ms window
+
+    def _execute_queued_scan(self) -> None:
+        """Called by debounce timer or after a scan finishes. Starts the scan for
+        the pending path if no other scan is currently running."""
+        if not self._pending_scan_path:
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            # Still busy; _on_scan_finished will call us again
+            return
+        self.current_image_path = self._pending_scan_path
+        self._pending_scan_path = ""
+        self.run_scan()
 
     # ------------------------------------------------------------------
     # Manual search
@@ -1716,14 +1991,7 @@ class MainWindow(QMainWindow):
         self.logger.info("USB watch: new file detected %s", newest)
         if self.camera_service.state.is_running:
             self._stop_camera()
-        self.current_image_path = newest
-        pixmap = QPixmap(newest)
-        if pixmap.isNull():
-            self.status_label.setText(f"Neues Foto erkannt (Bild nicht lesbar): {Path(newest).name}")
-            return
-        self.image_label.setPixmap(self._scale_pixmap(pixmap))
-        self.status_label.setText(f"Neues Foto: {Path(newest).name} – Scan startet …")
-        self.run_scan()
+        self._queue_scan(newest)
 
     def _on_candidate_double_clicked(self, row: int, _col: int) -> None:
         if 0 <= row < len(self.current_candidates):

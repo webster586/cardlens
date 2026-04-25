@@ -1,5 +1,4 @@
 #Requires -Version 5.1
-param([switch]$Installer)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -69,39 +68,7 @@ if (Test-Path $outDir) {
     Write-Host "  EXE     : $outDir\CardLens.exe"
     Write-Host ""
 
-    if ($Installer) {
-        Write-Host "Compiling Inno Setup installer..." -ForegroundColor Cyan
-        $iscc = $null
-        foreach ($candidate in @(
-            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-            "C:\Program Files\Inno Setup 6\ISCC.exe"
-        )) {
-            if (Test-Path $candidate) { $iscc = $candidate; break }
-        }
-        if (-not $iscc) {
-            $found = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-            if ($found) { $iscc = $found.Source }
-        }
-        if (-not $iscc) {
-            Write-Warning "Inno Setup 6 not found. Download from https://jrsoftware.org/isinfo.php"
-            Write-Warning "Then re-run: .\build.ps1 -Installer"
-        } else {
-            & $iscc "installer\pokemon_scanner.iss"
-            if ($LASTEXITCODE -eq 0) {
-                $setupExe = "installer\Output\PokemonScannerSetup.exe"
-                if (Test-Path $setupExe) {
-                    $setupMB = [math]::Round((Get-Item $setupExe).Length / 1MB, 0)
-                    Write-Host "Installer built!" -ForegroundColor Green
-                    Write-Host "  Setup   : $(Resolve-Path $setupExe)"
-                    Write-Host "  Size    : ~${setupMB} MB"
-                }
-            } else {
-                Write-Error "Inno Setup compilation failed."
-            }
-        }
-    } else {
-        Write-Host "Next: run  .\build.ps1 -Installer  to compile the Inno Setup installer." -ForegroundColor Cyan
-    }
 }
+
 
 Pop-Location

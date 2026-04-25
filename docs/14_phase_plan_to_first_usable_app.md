@@ -22,7 +22,7 @@ USB-Kamera-Livebild + OCR-Zone + Zoom
 Preisadapter (pokemontcg.io, eBay, Price-Aggregator)
 
 ## Phase H -- DONE
-Distribution: PyInstaller Build, paths.py Dual-Mode, build.ps1, Inno Setup .iss
+Distribution: PyInstaller Build, paths.py Dual-Mode, build.ps1
 
 ## First Usable App -- ERREICHT
 - Foto oder Kamera-Frame nutzbar: JA

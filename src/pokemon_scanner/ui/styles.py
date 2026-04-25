@@ -1,6 +1,102 @@
 """Global application stylesheet — dark mode theme."""
+from __future__ import annotations
 
-APP_QSS = """
+# ── Independent per-category font sizes ───────────────────────────────────
+# Each category can be adjusted separately via Debug-Konsole → Darstellung.
+# Defaults are chosen for a 96 dpi screen.
+
+# Body: main text, inputs, tabs, buttons
+_SIZE_BODY:    int = 13
+# Small: secondary labels, groupbox headers, tooltips, status bar, table headers
+_SIZE_SMALL:   int = 11
+# Extra-Small: progress bar, metadata, minor info lines
+_SIZE_XS:      int = 10
+# Tiny: hints, micro catalog labels, card-detail timestamps
+_SIZE_TINY:    int = 9
+# Heading: section headers, sidebar nav buttons, card names in panels
+_SIZE_HEADING: int = 15
+# Large: prices, key display values, bold number highlights
+_SIZE_LARGE:   int = 18
+# Card-price point size (QFont in album paintEvent – points, not pixels)
+_SIZE_CARD_PT: int = 6
+# Monospace: log-viewer / console (Consolas / Courier New)
+_SIZE_MONO:    int = 11
+
+# Legacy alias kept for callers that still use _CURRENT_BASE / set_base()
+_CURRENT_BASE: int = _SIZE_BODY
+
+
+# ── Setters ────────────────────────────────────────────────────────────────
+
+def set_base(base: int) -> None:
+    """Update body (base) font size. Also kept as legacy entry-point."""
+    global _SIZE_BODY, _CURRENT_BASE
+    _SIZE_BODY = _CURRENT_BASE = max(10, min(24, base))
+
+
+def set_small(v: int) -> None:
+    global _SIZE_SMALL
+    _SIZE_SMALL = max(8, min(22, v))
+
+
+def set_xs(v: int) -> None:
+    global _SIZE_XS
+    _SIZE_XS = max(7, min(20, v))
+
+
+def set_tiny(v: int) -> None:
+    global _SIZE_TINY
+    _SIZE_TINY = max(6, min(18, v))
+
+
+def set_heading(v: int) -> None:
+    global _SIZE_HEADING
+    _SIZE_HEADING = max(10, min(30, v))
+
+
+def set_large(v: int) -> None:
+    global _SIZE_LARGE
+    _SIZE_LARGE = max(12, min(40, v))
+
+
+def set_card_pt(v: int) -> None:
+    global _SIZE_CARD_PT
+    _SIZE_CARD_PT = max(4, min(16, v))
+
+
+def set_mono(v: int) -> None:
+    global _SIZE_MONO
+    _SIZE_MONO = max(7, min(22, v))
+
+
+# ── Getters ────────────────────────────────────────────────────────────────
+
+def size_body()    -> int: return _SIZE_BODY
+def size_small()   -> int: return _SIZE_SMALL
+def size_xs()      -> int: return _SIZE_XS
+def size_tiny()    -> int: return _SIZE_TINY
+def size_heading() -> int: return _SIZE_HEADING
+def size_large()   -> int: return _SIZE_LARGE
+def size_card_pt() -> int: return _SIZE_CARD_PT
+def size_mono()    -> int: return _SIZE_MONO
+
+
+def scale(logical: int, *, base: int | None = None) -> int:
+    """Proportionally scale *logical* (designed for base-13) to the current body base.
+
+    Example: scale(11) at base 16 → round(11 * 16/13) == 14
+    """
+    b = base if base is not None else _SIZE_BODY
+    return max(7, round(logical * b / 13))
+
+
+# Typography scale tokens (replaced at runtime by get_app_qss()):
+#   §BASE§     = _SIZE_BODY     (default 13 px)  — body, inputs, tabs, buttons
+#   §SM§       = _SIZE_SMALL    (default 11 px)  — labels, groupbox, tooltips, status
+#   §XS§       = _SIZE_XS       (default 10 px)  — progress bar, metadata
+#   §MONO§     = _SIZE_MONO     (default 11 px)  — log viewer / console
+
+_APP_QSS_TMPL = """
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    CardLens — Dark Mode (2026)
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
@@ -9,8 +105,8 @@ APP_QSS = """
 QWidget {
     background-color: #1e2030;
     color: #e2e8f0;
-    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-    font-size: 13px;
+    font-family: "Montserrat", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: §BASE§px;
 }
 QMainWindow { background-color: #151726; }
 QDialog     { background-color: #1e2030; }
@@ -23,7 +119,7 @@ QGroupBox {
     margin-top: 14px;
     padding: 10px 8px 8px 8px;
     font-weight: 600;
-    font-size: 12px;
+    font-size: §SM§px;
     color: #94a3b8;
 }
 QGroupBox::title {
@@ -41,9 +137,8 @@ QPushButton {
     color: #e2e8f0;
     border: 1px solid #4a5568;
     border-radius: 6px;
-    padding: 5px 14px;
+    padding: §PAD§px 14px;
     font-weight: 500;
-    min-height: 28px;
 }
 QPushButton:hover {
     background-color: #3d4a5c;
@@ -132,7 +227,7 @@ QHeaderView::section {
     border-bottom: 1px solid #334155;
     padding: 6px 10px;
     font-weight: 600;
-    font-size: 11px;
+    font-size: §SM§px;
 }
 
 /* ── Scroll bars ──────────────────────── */
@@ -157,7 +252,8 @@ QTabBar::tab {
     border: 1px solid #334155;
     border-bottom: none;
     border-radius: 6px 6px 0 0;
-    font-size: 12px;
+    font-size: §BASE§px;
+    font-weight: 500;
 }
 QTabBar::tab:selected { background: #5865f2; color: white; border-color: #5865f2; }
 QTabBar::tab:hover:!selected { background: #3d4a5c; color: white; }
@@ -175,7 +271,7 @@ QSlider::handle:horizontal:hover { background: #4752d0; }
 QSlider::sub-page:horizontal { background: #5865f2; border-radius: 2px; }
 
 /* ── Progress bar ─────────────────────── */
-QProgressBar { background-color: #2d3748; border: 1px solid #334155; border-radius: 4px; text-align: center; color: #e2e8f0; font-size: 10px; }
+QProgressBar { background-color: #2d3748; border: 1px solid #334155; border-radius: 4px; text-align: center; color: #e2e8f0; font-size: §XS§px; }
 QProgressBar::chunk { background-color: #5865f2; border-radius: 3px; }
 
 /* ── Labels / Frames ─────────────────── */
@@ -183,7 +279,7 @@ QLabel  { background: transparent; }
 QFrame  { background-color: transparent; }
 
 /* ── Tool tips ────────────────────────── */
-QToolTip { background-color: #252741; color: #e2e8f0; border: 1px solid #5865f2; border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+QToolTip { background-color: #252741; color: #e2e8f0; border: 1px solid #5865f2; border-radius: 4px; padding: 4px 8px; font-size: §SM§px; }
 
 /* ── Message boxes ────────────────────── */
 QMessageBox { background-color: #1e2030; }
@@ -202,6 +298,37 @@ QStatusBar {
     background-color: #151726;
     color: #94a3b8;
     border-top: 1px solid #334155;
-    font-size: 12px;
+    font-size: §SM§px;
+}
+
+/* ── Log viewer / console ─────────────── */
+QPlainTextEdit {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: §MONO§px;
+    background-color: #0d0f1a;
+    color: #94a3b8;
 }
 """
+
+
+def get_app_qss(base: int = 13) -> str:
+    """Return the application QSS with all current independent font-size categories.
+
+    *base* sets the body size; all other categories keep their independently stored
+    values unless they have been explicitly changed via set_small() / set_xs() etc.
+    Pass base=-1 to re-apply current values without changing the body size.
+    """
+    if base >= 0:
+        set_base(base)
+    pad = max(4, _SIZE_BODY - 5)
+    return (
+        _APP_QSS_TMPL
+        .replace("\u00a7BASE\u00a7px", f"{_SIZE_BODY}px")
+        .replace("\u00a7SM\u00a7px",   f"{_SIZE_SMALL}px")
+        .replace("\u00a7XS\u00a7px",   f"{_SIZE_XS}px")
+        .replace("\u00a7MONO\u00a7px", f"{_SIZE_MONO}px")
+        .replace("\u00a7PAD\u00a7px",  f"{pad}px")
+    )
+
+
+APP_QSS = get_app_qss()

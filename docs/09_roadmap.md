@@ -23,7 +23,7 @@
 ## Phase 6 Distribution -- DONE
 - PyInstaller --onedir Build mit EasyOCR-Modellen + Logos
 - paths.py Dual-Mode (dev / frozen APPDATA)
-- build.ps1 + Inno Setup .iss Skript
+- build.ps1
 - RAR-Archiv fuer direkte Weitergabe
 
 ## Phase 7 Bulk-Optimierung -- TEILWEISE DONE

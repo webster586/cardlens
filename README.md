@@ -4,19 +4,11 @@ Windows-Desktop-App zum Scannen, Identifizieren und Verwalten von Trading-Card-G
 
 **Quellcode & Lizenz:** [github.com/webster586/cardlens](https://github.com/webster586/cardlens) — MIT (eigener Code), LGPL v3 (PySide6/Qt)
 
-## Unterstützte TCGs (Markenzeichen)
+## TCG & Markenhinweis
 
-CardLens hat keine offizielle Verbindung zu den Herausgebern der unterstützten Kartenspiele.
-Alle Marken sind Eigentum ihrer jeweiligen Rechteinhaber:
-
-- **Pokémon TCG** — Nintendo / The Pokémon Company International
-- **Magic: The Gathering** — Wizards of the Coast LLC (Hasbro, Inc.)
-- **Yu-Gi-Oh!** — Konami Digital Entertainment Co., Ltd.
-- **Disney Lorcana** — The Walt Disney Company / Ravensburger AG
-- **One Piece / Dragon Ball Super / Digimon** — Bandai Co., Ltd.
-- **Flesh and Blood** — Legend Story Studios Ltd.
-- **Weiss Schwarz** — Bushiroad Inc.
-- **KeyForge** — Fantasy Flight Games / Asmodee Group
+CardLens unterstützt derzeit **Pokémon TCG**.
+Die App hat keine offizielle Verbindung zu Nintendo / The Pokémon Company International.
+Alle Marken sind Eigentum ihrer jeweiligen Rechteinhaber.
 
 ## Funktionsumfang (aktuell)
 
@@ -28,7 +20,7 @@ Alle Marken sind Eigentum ihrer jeweiligen Rechteinhaber:
 - Sammlungs-Datenbank (SQLite WAL)
 - Catalog-Dialog mit Set-Logos, Karten-Artwork, Top-Performer
 - Export nach CSV, JSON und XLSX
-- Inno Setup Installer + PyInstaller --onedir Build
+- PyInstaller --onedir Build (ZIP-Distribution)
 
 ## Datenschutz & Sicherheit
 
@@ -49,6 +41,5 @@ python -m src.pokemon_scanner.main
 ## Build
 
 ```powershell
-.\build.ps1            # PyInstaller → dist\CardLens\CardLens.exe
-.\build.ps1 -Installer # zusätzlich Inno Setup Installer
+.\build.ps1   # PyInstaller → dist\CardLens\CardLens.exe
 ```

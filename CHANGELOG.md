@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.6.1 - 2026-04-25 - Bild-Stabilität & Preis-Korrektheit
+
+### Fixed
+- `db/catalog_repository.py`: `images.scrydex.com` zur `_ALLOWED_IMAGE_HOSTS`-Whitelist hinzugefügt — Karten aus JP/Fan-Sets (z. B. "Ascended Heroes", "Mega Evolution") zeigten dauerhaft `?`-Platzhalter, weil ihre Bild-URLs auf scrydex.com zeigten und geblockt wurden; 4 fehlende Dateien werden nun beim nächsten Start nachgeladen
+- `datasources/pokemontcg.py`: EUR-Preis-Extraktion priorisiert jetzt `trendPrice` vor `averageSellPrice`; `averageSellPrice` mittelt historische Verkäufe (inkl. alter/graded) → viel zu hohe Preise bei verbreiteten Karten (z. B. Bulbasaur 151 = 59 € statt ~0,20 €); `trendPrice` spiegelt aktuellen Markt korrekt wider
+- `ui/album_widget.py`, `ui/album_scan_dialog.py`: `CardImageDownloadWorker` wurde mit `parent=self` erzeugt — bei Widget-Destroy löschte Qt den noch laufenden C++-Thread → `"QThread: Destroyed while thread is still running"` + Exit-Code 1; Fix: `parent` entfernt, stattdessen `finished.connect(deleteLater)` für sicheres async Cleanup
+
+### Changed
+- `db/catalog_repository.py` (Data): EUR-Preise für 98 Katalogeinträge aus DB gelöscht, damit sie beim nächsten Scan mit korrekter `trendPrice`-Logik neu abgerufen werden
+
+## 0.6.0 - 2026-04-24 - Wert-Verlauf & Set-Vollständigkeit
+
+### Added
+- `db/repositories.py`: neue Tabelle `collection_value_snapshots` (id, snapshot_date UNIQUE, total_value, unique_cards, total_qty, created_at); Migration beim App-Start
+- `db/repositories.py`: `CollectionRepository.record_collection_value_snapshot()` — speichert max. 1× pro Tag den aktuellen Gesamtwert der Sammlung
+- `db/repositories.py`: `CollectionRepository.get_collection_value_history()` — gibt alle Snapshots älteste→neueste zurück
+- `db/catalog_repository.py`: `CatalogRepository.get_set_completion()` — JOIN von `card_catalog` × `collection_entries`; liefert je Set: owned_count, catalog_count, set_total, set_series, release_year
+- `ui/stats_widget.py`: 3-Tab-Layout (Übersicht · Wert-Verlauf · Set-Vollständigkeit)
+  - **Übersicht**: bisherige 7 Metriken-Karten unverändert
+  - **Wert-Verlauf**: `_ValueHistoryChart` — Linien-Chart mit Gradientfill; täglich auto-snapshot beim Öffnen der Seite; X-Achse mit Datumslabels
+  - **Set-Vollständigkeit**: scrollbare Liste aller Sets aus dem Katalog mit QProgressBar, Bruchzahl (besessen / gesamt) und Komplett-Badge; sortiert neueste zuerst
+- `ui/main_window.py`: `StatsWidget` bekommt `catalog_repo=self.catalog_repo` übergeben
+
+
+### Added
+- `ui/stats_widget.py` (neu): Sammlungs-Statistiken-Seite mit 7 Metriken-Karten (einzigartige Karten, Exemplare, Gesamtwert, Zum Verkauf, Verkauft, Erlös, geschätzter Gewinn); eigener Sidebar-Eintrag "📊 Statistiken"
+- `db/repositories.py`: `CollectionRepository.get_collection_stats()` — aggregiert Karten, Menge, Marktwert, Verkaufserlös und Gewinn in einer DB-Abfrage
+- `db/repositories.py`: Migration ergänzt Spalte `price_alert REAL` in `collection_entries`
+- `db/repositories.py`: `CollectionRepository.set_price_alert(entry_id, threshold)` — setzt oder löscht Preisalarm-Schwellwert
+- `ui/market_widget.py`: Kauf-Tab vollständig implementiert: scrollbare Liste aller Sammlungskarten mit 🔔-Button pro Zeile; Alarm-Dialog (SpinBox €) zum Setzen des Zielpreises; Zeilen werden grün markiert und "ALARM: Preis unter Zielwert!" angezeigt, wenn `last_price ≤ price_alert`; Filter "Nur Alarme" + Suche
+### Changed
+- `ui/main_window.py`: Scan-Debounce via `QTimer` (400 ms, singleShot) in `_queue_scan()` — verhindert Pipeline-Überlastung bei schnellen Folder-Watch-Events; neuestes Bild wird stets gesetzt, ältere verworfen
+- `ui/main_window.py`: `_on_scan_finished()` und `_on_scan_error()` prüfen nach Abschluss auf ausstehende `_pending_scan_path` und starten den nächsten Scan automatisch
+- `ui/market_widget.py`: `list_all_for_market()` liefert nun auch `price_alert` im Ergebnisdict
+- `ui/market_widget.py`: Kauf-Tab lädt Daten lazy via `load_if_needed()` beim ersten Tab-Wechsel
+
 ## 0.4.5 - 2026-04-24 - Markt UI-Verbesserungen
 
 ### Changed
@@ -50,13 +86,12 @@
 
 ### Documentation
 - `README.md`: "Noch nicht enthalten"-Abschnitt entfernt; aktuellen Funktionsumfang, Datenschutz-Hinweise und Build-Anweisungen ergänzt
-- `ui/about_dialog.py`: Disclaimer-Text erweitert auf 10 TCG-Marken (Pokémon, MTG, Yu-Gi-Oh!, Lorcana, One Piece, Dragon Ball Super, Digimon, Flesh and Blood, Weiss Schwarz, KeyForge); Button-Text `&&`-Fix
+- `ui/about_dialog.py`: Disclaimer-Text aktualisiert; Button-Text `&&`-Fix
 
-## 0.4.0 - 2026-04-22 - Build & Installer Pipeline
+## 0.4.0 - 2026-04-22 - Build Pipeline
 ### Added
-- `build.ps1`: PyInstaller-Build-Script mit optionalem `-Installer`-Flag fuer Inno Setup
+- `build.ps1`: PyInstaller-Build-Script
 - `installer/runtime_hook_easyocr.py`: Runtime-Hook setzt `EASYOCR_MODULE_PATH` im frozen Build
-- `installer/pokemon_scanner.iss`: Inno Setup 6 Skript (kein UAC, Deinstall behaelt User-Daten)
 - `pokemon_scanner.spec`: PyInstaller --onedir Spec; buendelt EasyOCR-Modelle (~330 MB) und 85 Set-Logos (~5 MB)
 ### Changed
 - `core/paths.py`: Dual-Mode-Pfade (dev: Repo-Root, frozen: %APPDATA%\CardLens); `_seed_bundled_logos()` kopiert Logos bei erstem Start

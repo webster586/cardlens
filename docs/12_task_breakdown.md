@@ -26,7 +26,7 @@
 ## Distribution -- erledigt
 - PyInstaller Spec (EasyOCR-Modelle + Logos gebundelt)
 - paths.py Dual-Mode (dev/frozen)
-- build.ps1 + Inno Setup .iss
+- build.ps1
 - RAR-Archiv
 
 ## Performance-Optimierung (Audit III) -- erledigt 2026-04-22

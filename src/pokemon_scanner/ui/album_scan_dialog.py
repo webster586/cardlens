@@ -564,6 +564,7 @@ class _CardResultRow(QFrame):
             if _api_id:
                 self._worker = CardImageDownloadWorker(_api_id, candidate.image_url)
                 self._worker.done.connect(self._on_image)
+                self._worker.finished.connect(self._worker.deleteLater)
                 self._worker.start()
             else:
                 self._img_lbl.setText("?")

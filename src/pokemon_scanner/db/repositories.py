@@ -40,6 +40,8 @@ class CollectionRepository:
                 conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_listed_at TEXT")
             if "sale_sold_at" not in cols:
                 conn.execute("ALTER TABLE collection_entries ADD COLUMN sale_sold_at TEXT")
+            if "price_alert" not in cols:
+                conn.execute("ALTER TABLE collection_entries ADD COLUMN price_alert REAL")
             # Backfill api_id for existing rows that are missing it, by matching
             # name + set_name + card_number against card_catalog (same DB file).
             catalog_exists = conn.execute(
@@ -60,6 +62,12 @@ class CollectionRepository:
                 """)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_ce_api_id ON collection_entries(api_id)"
+            )
+            # Compound index for the identity-based fallback lookup used by
+            # upsert_by_identity() and find_by_identity() when api_id is absent.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_ce_identity"
+                " ON collection_entries(name, set_name, card_number, language)"
             )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sale_history (
@@ -83,6 +91,39 @@ class CollectionRepository:
                     sale_date TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
+            """)
+            # ── Gesamtwert-Verlauf ─────────────────────────────────────────
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS collection_value_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_date TEXT NOT NULL UNIQUE,
+                    total_value REAL NOT NULL,
+                    unique_cards INTEGER NOT NULL,
+                    total_qty INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_cvs_date"
+                " ON collection_value_snapshots(snapshot_date)"
+            )
+            # ── Katalog-Wunschpreise ───────────────────────────────────────
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS catalog_watch (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    api_id TEXT NOT NULL UNIQUE,
+                    wish_price REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_cw_api_id ON catalog_watch(api_id)"
+            )
+            # Clean up dangling album_slots (collection_entry was deleted but slot remained)
+            conn.execute("""
+                DELETE FROM album_slots
+                WHERE collection_entry_id IS NOT NULL
+                  AND collection_entry_id NOT IN (SELECT id FROM collection_entries)
             """)
             conn.commit()
         self._schema_initialized = True
@@ -362,6 +403,7 @@ class CollectionRepository:
 
     def delete_entry(self, entry_id: int) -> None:
         with self.database.connect() as conn:
+            conn.execute("DELETE FROM album_slots WHERE collection_entry_id = ?", (entry_id,))
             conn.execute("DELETE FROM collection_entries WHERE id = ?", (entry_id,))
             conn.commit()
 
@@ -374,6 +416,7 @@ class CollectionRepository:
     def clear_collection(self) -> None:
         """Delete every entry from the collection (factory reset). Catalog is untouched."""
         with self.database.connect() as conn:
+            conn.execute("DELETE FROM album_slots")
             conn.execute("DELETE FROM collection_entries")
             conn.commit()
 
@@ -435,6 +478,13 @@ class CollectionRepository:
                     (total_qty, keeper["id"]),
                 )
                 for did in ids_to_delete:
+                    # Reassign album slots to the keeper before deleting the duplicate,
+                    # so no slots become dangling after the merge.
+                    conn.execute(
+                        "UPDATE album_slots SET collection_entry_id = ? "
+                        "WHERE collection_entry_id = ?",
+                        (keeper["id"], did),
+                    )
                     conn.execute("DELETE FROM collection_entries WHERE id = ?", (did,))
                 removed += len(ids_to_delete)
 
@@ -578,19 +628,65 @@ class CollectionRepository:
             conn.commit()
 
     def list_all_for_market(self) -> list[dict]:
-        """Return all collection entries with sale columns and album location, ordered by name."""
+        """Return all collection entries with sale columns and album location, ordered by name.
+
+        Uses GROUP BY ce.id so that entries placed in multiple album slots are
+        never returned as duplicates.  Multiple album names are concatenated.
+        """
         with self.database.connect() as conn:
             rows = conn.execute(
                 "SELECT ce.id, ce.api_id, ce.name, ce.set_name, ce.card_number, ce.language, "
                 "ce.condition, ce.quantity, ce.last_price, ce.price_currency, ce.purchase_price, "
                 "ce.image_path, ce.sale_status, ce.sale_price, ce.sale_listed_at, ce.sale_sold_at, "
-                "a.name AS standort "
+                "ce.price_alert, "
+                "GROUP_CONCAT(DISTINCT a.name) AS standort "
                 "FROM collection_entries ce "
                 "LEFT JOIN album_slots sl ON sl.collection_entry_id = ce.id "
                 "LEFT JOIN albums a ON a.id = sl.album_id "
+                "GROUP BY ce.id "
                 "ORDER BY ce.name ASC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def set_price_alert(self, entry_id: int, threshold: float | None) -> None:
+        """Set or clear a price-alert threshold for a collection entry."""
+        with self.database.connect() as conn:
+            conn.execute(
+                "UPDATE collection_entries SET price_alert = ? WHERE id = ?",
+                (threshold, entry_id),
+            )
+            conn.commit()
+
+    def get_collection_stats(self) -> dict:
+        """Return aggregate statistics about the collection."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_cards,
+                    COALESCE(SUM(quantity), 0) AS total_quantity,
+                    COALESCE(SUM(COALESCE(last_price, 0) * COALESCE(quantity, 1)), 0) AS total_value,
+                    SUM(CASE WHEN sale_status = 'for_sale' THEN 1 ELSE 0 END) AS for_sale_count,
+                    SUM(CASE WHEN sale_status = 'sold' THEN 1 ELSE 0 END) AS sold_count,
+                    COALESCE(SUM(CASE WHEN sale_status = 'sold'
+                        THEN COALESCE(sale_price, 0) ELSE 0 END), 0) AS sold_revenue
+                FROM collection_entries
+                """
+            ).fetchone()
+            stats = dict(row) if row else {}
+            profit_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(
+                    sale_price
+                    - COALESCE(shipping_cost, 0)
+                    - COALESCE(purchase_price, 0)
+                ), 0) AS profit
+                FROM sale_history
+                WHERE purchase_price IS NOT NULL
+                """
+            ).fetchone()
+        stats["estimated_profit"] = float(profit_row["profit"]) if profit_row else 0.0
+        return stats
 
     def get_sold_history(self) -> list[dict]:
         """Return all entries from sale_history, most-recently-sold first."""
@@ -615,6 +711,115 @@ class CollectionRepository:
                 (shipping_cost, platform or None, buyer_note or None, history_id),
             )
             conn.commit()
+
+    # ── Gesamtwert-Verlauf ─────────────────────────────────────────────────
+
+    def record_collection_value_snapshot(self) -> None:
+        """Save today's total collection value. Silently ignored if already saved today."""
+        today = dt.datetime.utcnow().date().isoformat()
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            # Check if today already exists
+            exists = conn.execute(
+                "SELECT 1 FROM collection_value_snapshots WHERE snapshot_date = ?", (today,)
+            ).fetchone()
+            if exists:
+                return
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(COALESCE(last_price, 0) * COALESCE(quantity, 1)), 0) AS total_value,
+                    COUNT(*) AS unique_cards,
+                    COALESCE(SUM(quantity), 0) AS total_qty
+                FROM collection_entries
+                """
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "INSERT OR IGNORE INTO collection_value_snapshots"
+                    " (snapshot_date, total_value, unique_cards, total_qty, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (today, float(row["total_value"]), int(row["unique_cards"]),
+                     int(row["total_qty"]), now),
+                )
+                conn.commit()
+
+    def get_collection_value_history(self) -> list[dict]:
+        """Return all value snapshots ordered oldest → newest."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT snapshot_date, total_value, unique_cards, total_qty"
+                " FROM collection_value_snapshots ORDER BY snapshot_date ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Katalog-Wunschpreise ───────────────────────────────────────────────
+
+    def set_wish_price(self, api_id: str, wish_price: float | None) -> None:
+        """Set or clear a wish-price for a catalog card.
+
+        Pass *wish_price=None* to remove the entry.
+        """
+        now = dt.datetime.utcnow().isoformat()
+        with self.database.connect() as conn:
+            if wish_price is None:
+                conn.execute("DELETE FROM catalog_watch WHERE api_id = ?", (api_id,))
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO catalog_watch (api_id, wish_price, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(api_id) DO UPDATE SET wish_price = excluded.wish_price
+                    """,
+                    (api_id, wish_price, now),
+                )
+            conn.commit()
+
+    def get_watch_entries(self) -> list[dict]:
+        """Return all catalog_watch rows as [{api_id, wish_price}, ...]."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT api_id, wish_price FROM catalog_watch"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_triggered_watch_entries(self) -> list[dict]:
+        """Return catalog_watch rows where the current catalog price ≤ wish_price.
+
+        Joins catalog_watch with card_catalog on api_id.
+        Result keys: api_id, wish_price, name, set_name, card_number, best_price, eur_price.
+        """
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    cw.api_id,
+                    cw.wish_price,
+                    cc.name,
+                    cc.set_name,
+                    cc.card_number,
+                    cc.best_price,
+                    cc.eur_price
+                FROM catalog_watch cw
+                JOIN card_catalog cc ON cc.api_id = cw.api_id
+                WHERE
+                    COALESCE(cc.eur_price, cc.best_price) IS NOT NULL
+                    AND COALESCE(cc.eur_price, cc.best_price) <= cw.wish_price
+                ORDER BY cc.name ASC
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_owned_counts_by_api_id(self) -> dict[str, int]:
+        """Return {api_id: total_quantity} for all collection entries with an api_id."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT api_id, SUM(quantity) AS qty"
+                " FROM collection_entries"
+                " WHERE api_id IS NOT NULL"
+                " GROUP BY api_id"
+            ).fetchall()
+        return {r["api_id"]: int(r["qty"] or 0) for r in rows}
 
 
 class AlbumRepository:
@@ -733,7 +938,11 @@ class AlbumRepository:
         return {"market": market, "purchase": purchase}
 
     def get_page_slots_with_entries(self, album_id: int, page_num: int) -> list[dict]:
-        """Return slot data for a page, joined with collection + catalog info."""
+        """Return slot data for a page, joined with collection + catalog info.
+
+        Dangling slots (collection_entry_id references a deleted entry) are
+        silently skipped so they don't render as phantom filled slots.
+        """
         with self.database.connect() as conn:
             rows = conn.execute(
                 """
@@ -749,7 +958,7 @@ class AlbumRepository:
                     ce.purchase_price,
                     cc.image_url AS catalog_image_url
                 FROM album_slots s
-                LEFT JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                INNER JOIN collection_entries ce ON ce.id = s.collection_entry_id
                 LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
                 WHERE s.album_id = ? AND s.page_num = ?
                 ORDER BY s.slot_index ASC
@@ -827,6 +1036,94 @@ class AlbumRepository:
                 )
             conn.commit()
 
+    def get_album_card_count(self, album_id: int) -> int:
+        """Return number of filled slots in the album."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM album_slots"
+                " WHERE album_id = ? AND collection_entry_id IS NOT NULL",
+                (album_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def get_album_api_ids(self, album_id: int) -> list[str]:
+        """Return distinct api_ids for all filled slots in the album."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT ce.api_id
+                   FROM album_slots s
+                   JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                   WHERE s.album_id = ? AND ce.api_id IS NOT NULL AND ce.api_id != ''""",
+                (album_id,),
+            ).fetchall()
+        return [r["api_id"] for r in rows]
+
+    def get_album_cover_path(self, album_id: int) -> str | None:
+        """Return local image path of the first card in the album (for cover thumbnail)."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(cc.local_image_path, ce.image_path) AS img
+                FROM album_slots s
+                JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ?
+                  AND (cc.local_image_path IS NOT NULL OR ce.image_path IS NOT NULL)
+                ORDER BY s.page_num ASC, s.slot_index ASC
+                LIMIT 1
+                """,
+                (album_id,),
+            ).fetchone()
+        return str(row["img"]) if row and row["img"] else None
+
+    def get_album_first_card_info(self, album_id: int) -> dict | None:
+        """Return api_id, image_url, local_image_path for the first filled slot."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ce.api_id,
+                       COALESCE(cc.local_image_path, '') AS local_image_path,
+                       COALESCE(cc.image_url, '')        AS image_url
+                FROM album_slots s
+                JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc  ON cc.api_id = ce.api_id
+                WHERE s.album_id = ? AND ce.api_id IS NOT NULL AND ce.api_id != ''
+                ORDER BY s.page_num ASC, s.slot_index ASC
+                LIMIT 1
+                """,
+                (album_id,),
+            ).fetchone()
+        if row and row["api_id"]:
+            return {
+                "api_id": row["api_id"],
+                "local_image_path": row["local_image_path"],
+                "image_url": row["image_url"],
+            }
+        return None
+
+    def get_album_value(self, album_id: int) -> tuple[float, float]:
+        """Return (eur_sum, usd_sum) of best_price for all slots in the album."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT cc.best_price, cc.price_currency
+                FROM album_slots s
+                JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc  ON cc.api_id = ce.api_id
+                WHERE s.album_id = ? AND s.collection_entry_id IS NOT NULL
+                """,
+                (album_id,),
+            ).fetchall()
+        eur, usd = 0.0, 0.0
+        for r in rows:
+            price = r["best_price"] or 0.0
+            cur = (r["price_currency"] or "EUR").upper()
+            if cur == "USD":
+                usd += price
+            else:
+                eur += price
+        return (eur, usd)
+
     def get_album_set_logos(self, album_id: int) -> list[tuple[str, str | None]]:
         """Return list of (set_name, local_logo_path) for distinct sets in this album."""
         with self.database.connect() as conn:
@@ -856,9 +1153,12 @@ class AlbumPageRepository:
 
     def __init__(self, database: Database) -> None:
         self.database = database
+        self._schema_initialized: bool = False
         self._migrate()
 
     def _migrate(self) -> None:
+        if self._schema_initialized:
+            return
         with self.database.connect() as conn:
             conn.execute(
                 """
@@ -872,6 +1172,7 @@ class AlbumPageRepository:
                 """
             )
             conn.commit()
+        self._schema_initialized = True
 
     def find_name(self, image_path: str) -> str:
         """Return saved page name for *image_path*, or '' if not found."""

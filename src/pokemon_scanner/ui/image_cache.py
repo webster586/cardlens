@@ -125,6 +125,10 @@ class CardImageDownloadWorker(QThread):
         self._url = url
 
     def run(self) -> None:
+        if not self._url.startswith(("http://", "https://")):
+            _log.debug("Skipping non-HTTP image URL for %s", self._api_id)
+            self.done.emit("")
+            return
         dest = card_image_path(self._api_id)
         try:
             req = urllib.request.Request(self._url, headers={"User-Agent": "CardLens/1.0"})

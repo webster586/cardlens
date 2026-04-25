@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 import requests as _requests
 from PySide6.QtCore import Qt, QPointF, QSize, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPixmapCache
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit,
@@ -18,6 +18,7 @@ from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
 from src.pokemon_scanner.ui.image_cache import resolve_card_image
 from src.pokemon_scanner.ui.album_widget import AlbenWidget
 from src.pokemon_scanner.db.repositories import AlbumRepository
+from src.pokemon_scanner.ui.styles import scale
 
 _THUMB_W = 200
 _THUMB_H = 280
@@ -51,6 +52,153 @@ def _cached_pixmap(path: str, height: int, width: int = 0) -> QPixmap:
     return pm
 
 
+# ── Painted circle buttons (no QSS rendering artefacts) ──────────────────────
+
+class _CirclePlusBtn(QPushButton):
+    """'+' button drawn via paintEvent — perfect circle and centred cross."""
+    _SZ = 28
+    _BLUE   = QColor("#3a7ecf")
+    _BLUE_H = QColor("#2563eb")
+    _GREEN  = QColor("#16a34a")
+    _GREEN_H = QColor("#15803d")
+    _WHITE  = QColor("#ffffff")
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(self._SZ, self._SZ)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hovered = False
+        self._selected = False
+
+    def set_selected(self, val: bool) -> None:
+        self._selected = val
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        border = 2
+        sz = self._SZ
+        base   = self._GREEN   if self._selected else self._BLUE
+        hover  = self._GREEN_H if self._selected else self._BLUE_H
+        fill   = hover if self._hovered else base
+        p.setBrush(fill)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(border, border, sz - 2*border, sz - 2*border)
+        cross = QPen(self._WHITE, 2)
+        cross.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(cross)
+        cx, cy, arm = sz // 2, sz // 2, 5
+        p.drawLine(cx - arm, cy, cx + arm, cy)
+        p.drawLine(cx, cy - arm, cx, cy + arm)
+        p.end()
+
+
+class _CircleRemoveBtn(QPushButton):
+    """Small red circle × button drawn via paintEvent."""
+    _SZ    = 20
+    _RED   = QColor("#c0392b")
+    _RED_H = QColor("#e74c3c")
+    _WHITE = QColor("#ffffff")
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(self._SZ, self._SZ)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hovered = False
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True; self.update(); super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False; self.update(); super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        sz = self._SZ
+        p.setBrush(self._RED_H if self._hovered else self._RED)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(1, 1, sz - 2, sz - 2)
+        pen = QPen(self._WHITE, 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        cx, cy, arm = sz // 2, sz // 2, 4
+        p.drawLine(cx - arm, cy - arm, cx + arm, cy + arm)
+        p.drawLine(cx + arm, cy - arm, cx - arm, cy + arm)
+        p.end()
+
+
+class _OwnedBadge(QWidget):
+    """Green pill badge showing ownership count, drawn via paintEvent."""
+    _GREEN = QColor("#1a8a1a")
+    _WHITE = QColor("#ffffff")
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._text = text
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        fnt = QFont()
+        fnt.setPointSize(8)
+        fnt.setBold(True)
+        self.setFont(fnt)
+        fm = QFontMetrics(fnt)
+        w = fm.horizontalAdvance(text) + 10
+        h = fm.height() + 4
+        self.setFixedSize(max(w, h), h)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.height() / 2
+        p.setBrush(self._GREEN)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(0, 0, self.width(), self.height(), r, r)
+        p.setPen(QPen(self._WHITE))
+        p.setFont(self.font())
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
+
+
+class _CircleCheckOverlay(QWidget):
+    """Non-clickable green circle with ✔ drawn via paintEvent."""
+    _SZ     = 28
+    _GREEN  = QColor("#16a34a")
+    _WHITE  = QColor("#ffffff")
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(self._SZ, self._SZ)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        border = 2
+        sz = self._SZ
+        p.setBrush(self._GREEN)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(border, border, sz - 2*border, sz - 2*border)
+        pen = QPen(self._WHITE, 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        cx, cy = sz // 2, sz // 2
+        p.drawLine(cx - 5, cy, cx - 1, cy + 4)
+        p.drawLine(cx - 1, cy + 4, cx + 5, cy - 4)
+        p.end()
+
+
 # ── Card detail / edit dialog ─────────────────────────────────────────────────
 
 class _CardDetailDialog(QDialog):
@@ -73,6 +221,7 @@ class _CardDetailDialog(QDialog):
         self._current_idx: int = current_idx
         self._orig_values: dict = {}
 
+        self._any_saved = False
         self.setModal(True)
         self.resize(480, 760)
         self.setStyleSheet(
@@ -227,7 +376,7 @@ class _CardDetailDialog(QDialog):
         _pp_clear.setToolTip("Einkaufspreis löschen")
         _pp_clear.setStyleSheet(
             "QPushButton{background:#252741;border:1px solid #334155;border-radius:4px;"
-            "color:#94a3b8;font-size:13px;padding:0;min-width:22px;max-width:22px;"
+            f"color:#94a3b8;font-size:{scale(13)}px;padding:0;min-width:22px;max-width:22px;"
             "min-height:22px;max-height:22px;text-align:center;}"
             "QPushButton:hover{background:#7f1d1d;border-color:#ef4444;color:white;}"
         )
@@ -242,21 +391,22 @@ class _CardDetailDialog(QDialog):
         # ── Buttons ───────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        btn_cancel = QPushButton("Abbrechen")
-        btn_cancel.setStyleSheet(
+        btn_close = QPushButton("Schließen")
+        btn_close.setStyleSheet(
             "QPushButton { background: #252741; color: #94a3b8; border: 1px solid #334155; }"
             "QPushButton:hover { background: #334155; color: #e2e8f0; }"
         )
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        btn_save = QPushButton("Speichern")
-        btn_save.setStyleSheet(
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        self._btn_save = QPushButton("Speichern")
+        self._btn_save.setStyleSheet(
             "QPushButton { background: #5865f2; color: white; border: none; font-weight: bold; }"
             "QPushButton:hover { background: #4752c4; }"
+            "QPushButton:disabled { background: #2e7d32; color: #a5d6a7; }"
         )
-        btn_save.setDefault(True)
-        btn_save.clicked.connect(lambda: self._save(close=True))
-        btn_row.addWidget(btn_save)
+        self._btn_save.setDefault(True)
+        self._btn_save.clicked.connect(lambda: self._save(close=False))
+        btn_row.addWidget(self._btn_save)
         main.addLayout(btn_row)
 
         # Load initial entry data
@@ -336,7 +486,7 @@ class _CardDetailDialog(QDialog):
             self._img_lbl.setText("?")
             self._img_lbl.setStyleSheet(
                 "border: 1px solid #334155; background: #111827; border-radius: 6px;"
-                " color:#888; font-size:32px;"
+                f" color:#888; font-size:{scale(32)}px;"
             )
 
         # Snapshot original values for dirty-check
@@ -371,8 +521,16 @@ class _CardDetailDialog(QDialog):
             purchase_price=pp if pp > 0.0 else None,
         )
         self._orig_values = self._snapshot()  # reset dirty state
+        self._any_saved = True
         if close:
             self.accept()
+        else:
+            self._btn_save.setText("✓ Gespeichert")
+            self._btn_save.setEnabled(False)
+            QTimer.singleShot(1500, lambda: (
+                self._btn_save.setText("Speichern"),
+                self._btn_save.setEnabled(True),
+            ))
 
 
 class _CardTile(QFrame):
@@ -423,31 +581,19 @@ class _CardTile(QFrame):
             img_lbl.setPixmap(px)
         else:
             img_lbl.setText("?")
-            img_lbl.setStyleSheet(img_lbl.styleSheet() + " color:#888888; font-size:24px;")
+            img_lbl.setStyleSheet(img_lbl.styleSheet() + f" color:#888888; font-size:{scale(24)}px;")
 
         if owned_row:
             qty = owned_row.get("quantity", 1) or 1
             badge_text = f"{_CHECK}\u202f{qty}\u00d7" if qty > 1 else _CHECK
-            badge = QLabel(badge_text, thumb_container)
-            badge.setStyleSheet(
-                "background:#1a8a1a; color:white; font-size:11px;"
-                " font-weight:bold; border-radius:8px; padding:1px 4px;"
-                " border:none;"
-            )
-            badge.adjustSize()
+            badge = _OwnedBadge(badge_text, thumb_container)
             badge.move(_THUMB_W - badge.width() - 2, 2)
             badge.raise_()
 
             # Remove button (×) top-left
             entry_id: int | None = owned_row.get("id")
-            rm_btn = QPushButton("\u00d7", thumb_container)
-            rm_btn.setFixedSize(20, 20)
+            rm_btn = _CircleRemoveBtn(thumb_container)
             rm_btn.move(2, 2)
-            rm_btn.setStyleSheet(
-                "QPushButton { background:#c0392b; color:white; font-size:13px;"
-                " font-weight:bold; border-radius:10px; border:none; padding:0; }"
-                "QPushButton:hover { background:#e74c3c; }"
-            )
             if entry_id:
                 rm_btn.clicked.connect(lambda _checked, eid=entry_id: self.remove_requested.emit(eid))
             else:
@@ -455,13 +601,7 @@ class _CardTile(QFrame):
             rm_btn.raise_()
 
         # Selection checkmark overlay (bottom-right of thumbnail, shown when selected)
-        self._check_overlay = QLabel("✔", thumb_container)
-        self._check_overlay.setFixedSize(28, 28)
-        self._check_overlay.setAlignment(Qt.AlignCenter)
-        self._check_overlay.setStyleSheet(
-            "background:#16a34a;color:white;font-size:14px;font-weight:bold;"
-            "border-radius:14px;border:none;"
-        )
+        self._check_overlay = _CircleCheckOverlay(thumb_container)
         self._check_overlay.move(_THUMB_W - 30, _THUMB_H - 30)
         self._check_overlay.setVisible(False)
         self._check_overlay.raise_()
@@ -469,17 +609,17 @@ class _CardTile(QFrame):
         vbox.addWidget(thumb_container, 0, Qt.AlignHCenter)
 
         en_name = entry.get("name", "")
-        vbox.addWidget(_lbl(en_name, "font-weight:bold; font-size:11px;"))
+        vbox.addWidget(_lbl(en_name, f"font-weight:bold; font-size:{scale(11)}px;"))
 
         # Show German name below the English name (if known)
         from src.pokemon_scanner.core.name_translations import translate_to_de as _t2de
         _de_name = _t2de(en_name)
         if _de_name:
             vbox.addWidget(_lbl(_de_name.capitalize(),
-                                "font-size:9px; color:#1e40af; font-style:italic;"))
+                                f"font-size:{scale(9)}px; color:#1e40af; font-style:italic;"))
 
         sn = f"{entry.get('set_name') or ''}  #{entry.get('card_number') or ''}".strip()
-        vbox.addWidget(_lbl(sn, "font-size:9px; color:#64748b;"))
+        vbox.addWidget(_lbl(sn, f"font-size:{scale(9)}px; color:#64748b;"))
         # Language badge — colored pill label, works reliably on Windows (no emoji needed)
         _LANG_BADGE: dict[str, tuple[str, str, str]] = {
             # lang_code: (label, bg_color, text_color)
@@ -502,17 +642,17 @@ class _CardTile(QFrame):
             _badge.setAlignment(Qt.AlignCenter)
             _badge.setFixedHeight(16)
             _badge.setStyleSheet(
-                f"background:{bg}; color:{fg}; font-size:9px; font-weight:bold;"
+                f"background:{bg}; color:{fg}; font-size:{scale(9)}px; font-weight:bold;"
                 f" border-radius:3px; padding: 0 4px;"
             )
             vbox.addWidget(_badge)
         elif display_lang:
-            vbox.addWidget(_lbl(display_lang, "font-size:9px; color:#64748b;"))
+            vbox.addWidget(_lbl(display_lang, f"font-size:{scale(9)}px; color:#64748b;"))
 
         if owned_row and owned_row.get("last_price") is not None:
             sc, cur = owned_row["last_price"], owned_row.get("price_currency") or "USD"
             vbox.addWidget(_lbl(f"Bei Scan: {sc:.2f}\u202f{cur}",
-                                "font-size:9px; color:#16a34a; font-weight:bold;"))
+                                f"font-size:{scale(9)}px; color:#16a34a; font-weight:bold;"))
 
         if owned_row:
             _COND_COLOR = {"M": "#16a34a", "NM": "#16a34a", "LP": "#ca8a04", "MP": "#ea580c", "HP": "#dc2626"}
@@ -526,21 +666,8 @@ class _CardTile(QFrame):
             )
             vbox.addWidget(cond_lbl)
 
-            # Bearbeiten button (only for owned cards with a DB id)
-            _eid = owned_row.get("id")
-            if _eid:
-                _detail_btn = QPushButton("✏ Bearbeiten")
-                _detail_btn.setFixedHeight(22)
-                _detail_btn.setStyleSheet(
-                    "QPushButton{background:#252741;color:#a5b4fc;font-size:9px;"
-                    "font-weight:bold;border-radius:4px;border:1px solid #4f46e5;"
-                    "padding:0 6px;}"
-                    "QPushButton:hover{background:#4f46e5;color:white;}"
-                )
-                _detail_btn.clicked.connect(
-                    lambda _checked, eid=_eid: self.detail_requested.emit(eid)
-                )
-                vbox.addWidget(_detail_btn)
+            if owned_row.get("id"):
+                self.setCursor(Qt.PointingHandCursor)
 
         price = entry.get("best_price")
         cur2 = entry.get("price_currency") or "USD"
@@ -609,13 +736,7 @@ class _CardTile(QFrame):
         self._qty_spin.setStyleSheet("font-size:10px;")
         sel_row.addWidget(self._qty_spin)
         sel_row.addStretch()
-        self._add_btn = QPushButton("+")
-        self._add_btn.setFixedSize(28, 28)
-        self._add_btn.setStyleSheet(
-            "QPushButton{background:#3a7ecf;color:white;font-size:18px;font-weight:bold;"
-            "border-radius:14px;border:none;padding:0;}"
-            "QPushButton:hover{background:#2563eb;}"
-        )
+        self._add_btn = _CirclePlusBtn()
         self._add_btn.clicked.connect(self._toggle_select)
         sel_row.addWidget(self._add_btn)
         vbox.addLayout(sel_row)
@@ -624,15 +745,11 @@ class _CardTile(QFrame):
         self._selected = not self._selected
         self._check_overlay.setVisible(self._selected)
         self._qty_spin.setVisible(self._selected)
+        self._add_btn.set_selected(self._selected)
         if self._selected:
             self.setStyleSheet(
                 "QFrame#tile{background:#1a2540;border:2px solid #2563eb;border-radius:6px;}"
                 "QFrame#tile QLabel{border:none;background:transparent;}"
-            )
-            self._add_btn.setStyleSheet(
-                "QPushButton{background:#16a34a;color:white;font-size:18px;font-weight:bold;"
-                "border-radius:14px;border:none;padding:0;}"
-                "QPushButton:hover{background:#15803d;}"
             )
         else:
             bg = "#162820" if self._owned_row else "#1e2030"
@@ -641,11 +758,13 @@ class _CardTile(QFrame):
                 f"QFrame#tile{{background:{bg};border:2px solid {bd};border-radius:6px;}}"
                 "QFrame#tile QLabel{border:none;background:transparent;}"
             )
-            self._add_btn.setStyleSheet(
-                "QPushButton{background:#3a7ecf;color:white;font-size:18px;font-weight:bold;"
-                "border-radius:14px;border:none;padding:0;}"
-                "QPushButton:hover{background:#2563eb;}"
-            )
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton and self._owned_row:
+            eid = self._owned_row.get("id")
+            if eid:
+                self.detail_requested.emit(eid)
 
     def get_selection(self) -> tuple[dict, int] | None:
         """Return (entry, quantity) if this tile is selected, else None."""
@@ -1587,13 +1706,13 @@ class _RefreshWorker(QThread):
                 )
                 if resp.ok:
                     card = resp.json().get("data", {})
-                    price = self._extract_price(card)
+                    eur, usd = self._extract_prices(card)
                     img_url = (
                         card.get("images", {}).get("small")
                         or card.get("images", {}).get("large")
                         or ""
                     )
-                    self._repo.update_price(api_id, price, "USD", image_url=img_url or None)
+                    self._repo.update_prices(api_id, eur, usd, image_url=img_url or None)
                     if img_url:
                         self._repo.save_local_image(api_id, img_url)
                 else:
@@ -1610,7 +1729,30 @@ class _RefreshWorker(QThread):
         self.done.emit()
 
     @staticmethod
+    def _extract_prices(card: dict) -> tuple[float | None, float | None]:
+        """Return (eur_price, usd_price) from Cardmarket + TCGPlayer data."""
+        eur = None
+        for key in ("averageSellPrice", "trendPrice", "lowPrice"):
+            p = card.get("cardmarket", {}).get("prices", {}).get(key)
+            if p is not None:
+                eur = round(float(p), 2)
+                break
+        usd = None
+        tcg_prices = card.get("tcgplayer", {}).get("prices", {})
+        for variant in (
+            "normal", "holofoil", "reverseHolofoil",
+            "1stEditionHolofoil", "1stEditionNormal",
+            "unlimited", "unlimitedHolofoil", "promo",
+        ):
+            p = tcg_prices.get(variant, {}).get("market")
+            if p is not None:
+                usd = round(float(p), 2)
+                break
+        return eur, usd
+
+    @staticmethod
     def _extract_price(card: dict) -> float | None:
+        """Legacy helper — kept for callers that only need a single value."""
         prices = card.get("tcgplayer", {}).get("prices", {})
         for variant in ("normal", "holofoil", "reverseHolofoil", "1stEditionHolofoil"):
             p = prices.get(variant, {}).get("market")
@@ -2809,7 +2951,7 @@ class CatalogWidget(QWidget):
 
         # ── Alben subtab ────────────────────────────────────────────────────
         _album_repo = AlbumRepository(collection_repo.database)
-        self._alben_widget = AlbenWidget(_album_repo, collection_repo)
+        self._alben_widget = AlbenWidget(_album_repo, collection_repo, catalog_repo)
         self._samm_inner_tabs.addTab(self._alben_widget, "\U0001f4d2  Alben")
 
         self._samm_inner_tabs.currentChanged.connect(self._on_samm_inner_tab_changed)
@@ -3236,7 +3378,8 @@ class CatalogWidget(QWidget):
             entry_id, self._col_repo, cat_entry, self,
             siblings=siblings, current_idx=current_idx,
         )
-        if dlg.exec() == QDialog.Accepted:
+        dlg.exec()
+        if dlg._any_saved:
             self._load_sammlung(_fetch_images=False)
 
     def _adopt_selection(self) -> None:

@@ -15,7 +15,6 @@ pokemon_scanner_repo/
     ui/             -- main_window.py, catalog_dialog.py, styles.py
   installer/
     runtime_hook_easyocr.py  -- PyInstaller Runtime-Hook
-    pokemon_scanner.iss      -- Inno Setup 6 Installer-Skript
   tests/
   scripts/         -- bootstrap_env.ps1, run_dev.py
   docs/
