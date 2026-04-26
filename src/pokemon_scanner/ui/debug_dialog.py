@@ -160,9 +160,21 @@ class DebugDialog(QDialog):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setSpacing(6)
 
         s = self._settings
+
+        _SEC_SS = (
+            "font-weight: 700; font-size: 11px; color: #818cf8;"
+            " text-transform: uppercase; letter-spacing: 1px;"
+            " border-bottom: 1px solid #334155; padding-bottom: 3px;"
+            " margin-top: 6px;"
+        )
+
+        def _section(title: str) -> None:
+            lbl = QLabel(title)
+            lbl.setStyleSheet(_SEC_SS)
+            layout.addWidget(lbl)
 
         def _cat_row(
             label: str,
@@ -170,6 +182,7 @@ class DebugDialog(QDialog):
             lo: int,
             hi: int,
             attr: str,
+            unit: str = "px",
         ) -> tuple[QSlider, QLabel]:
             """Add one labelled slider row and return (slider, value_label)."""
             hdr = QLabel(label)
@@ -181,16 +194,18 @@ class DebugDialog(QDialog):
             sl.setValue(current)
             sl.setTickInterval(1)
             sl.setTickPosition(QSlider.TickPosition.TicksBelow)
-            vl = QLabel(f"{current} px")
+            vl = QLabel(f"{current} {unit}")
             vl.setMinimumWidth(44)
             vl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            sl.valueChanged.connect(lambda v, lbl=vl, u="px": lbl.setText(f"{v} {u}"))
+            sl.valueChanged.connect(lambda v, lbl=vl, u=unit: lbl.setText(f"{v} {u}"))
             row.addWidget(sl)
             row.addWidget(vl)
             layout.addLayout(row)
             setattr(self, attr, sl)
             return sl, vl
 
+        # ── Allgemein ────────────────────────────────────────────────────────
+        _section("Allgemein  —  Hauptfenster & alle Dialoge")
         _cat_row(
             "Fließtext  (body)  — Eingaben, Tabs, Buttons",
             s.ui_font_size if s else size_body(), 10, 22, "_sl_body",
@@ -200,6 +215,20 @@ class DebugDialog(QDialog):
             s.ui_font_small if s else size_small(), 8, 20, "_sl_small",
         )
         _cat_row(
+            "Überschriften  (heading)  — Sektions-Header, Kartennamen in Panels",
+            s.ui_font_heading if s else size_heading(), 10, 28, "_sl_heading",
+        )
+
+        # ── Scan & Markt ─────────────────────────────────────────────────────
+        _section("Scan & Markt  —  Scan-Panel, Marktpreise")
+        _cat_row(
+            "Preisanzeige  (large)  — Hauptpreise, Highlight-Zahlen",
+            s.ui_font_large if s else size_large(), 12, 36, "_sl_large",
+        )
+
+        # ── Katalog ──────────────────────────────────────────────────────────
+        _section("Katalog  —  Katalog-Dialog, Fortschritt, Metadaten")
+        _cat_row(
             "Metadaten  (xs)  — Fortschrittsbalken, Nebeninfos",
             s.ui_font_xs if s else size_xs(), 7, 18, "_sl_xs",
         )
@@ -207,33 +236,16 @@ class DebugDialog(QDialog):
             "Mini-Labels  (tiny)  — Hinweise, Katalog-Kleintext",
             s.ui_font_tiny if s else size_tiny(), 6, 16, "_sl_tiny",
         )
+
+        # ── Album ─────────────────────────────────────────────────────────────
+        _section("Album  —  Karten-Raster, Preis-Badges")
         _cat_row(
-            "Überschriften  (heading)  — Sektions-Header, Kartennamen in Panels",
-            s.ui_font_heading if s else size_heading(), 10, 28, "_sl_heading",
-        )
-        _cat_row(
-            "Preisanzeige  (large)  — Hauptpreise, Highlight-Zahlen",
-            s.ui_font_large if s else size_large(), 12, 36, "_sl_large",
+            "Kartenpreis  (card_pt)  — Preis-Beschriftung auf Album-Karte  (Punkte)",
+            s.ui_font_card_pt if s else size_card_pt(), 4, 14, "_sl_card_pt", unit="pt",
         )
 
-        # Card-price uses point size, not pixels — separate label
-        hdr_cp = QLabel("Kartenpreis  (card_pt)  — Preis-Beschriftung auf Album-Karte  (Punkte)")
-        hdr_cp.setStyleSheet("font-weight: 600; color: #e2e8f0;")
-        layout.addWidget(hdr_cp)
-        row_cp = QHBoxLayout()
-        self._sl_card_pt = QSlider(Qt.Orientation.Horizontal)
-        self._sl_card_pt.setRange(4, 14)
-        self._sl_card_pt.setValue(s.ui_font_card_pt if s else size_card_pt())
-        self._sl_card_pt.setTickInterval(1)
-        self._sl_card_pt.setTickPosition(QSlider.TickPosition.TicksBelow)
-        vl_cp = QLabel(f"{self._sl_card_pt.value()} pt")
-        vl_cp.setMinimumWidth(44)
-        vl_cp.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._sl_card_pt.valueChanged.connect(lambda v: vl_cp.setText(f"{v} pt"))
-        row_cp.addWidget(self._sl_card_pt)
-        row_cp.addWidget(vl_cp)
-        layout.addLayout(row_cp)
-
+        # ── Debug / Konsole ───────────────────────────────────────────────────
+        _section("Debug / Konsole  —  Log-Viewer")
         _cat_row(
             "Konsole / Log  (mono)  — Consolas-Schrift im Log-Viewer",
             s.ui_font_mono if s else size_mono(), 7, 20, "_sl_mono",

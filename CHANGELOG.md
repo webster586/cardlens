@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.3 - 2026-04-27 - Album Kartenslots & TOC Inhaltsübersicht
+
+### Added
+- `db/repositories.py`: neue Methode `AlbumRepository.get_album_pages_detail(album_id)` — liefert eine Zeile pro belegtem Slot (page_num, set_name, card_name, card_value, purchase_price), sortiert nach Seite / Set / Name; wird vom TOC-Panel genutzt
+- `datasources/name_translator.py`: `_ROMANIZATION_ALIASES`-Dict für Pokémon mit Runic/CJK-Namen (Baojian → Chien-Pao, Wochien → Wo-Chien, Chiyu → Chi-Yu, Chiling → Ting-Lu); `find_en_names_for_de_partial()` prüft Aliases vor regulärer Fuzzy-Suche
+
+### Changed
+- `ui/album_widget.py`: `_AlbumTocPanel.refresh()` komplett neu als Listenansicht — pro Seite: Header-Zeile (weiß/fett, „Seite N" | „K Karten" | Seitenwert), G&V-Zeile (grün/rot), dann pro Set: Set-Name-Zeile (blau/fett, 8 px Einzug) + je Karten-Zeile (grau, 16 px Einzug); nutzt `get_album_pages_detail()`
+- `ui/album_widget.py`: Kartenslots im Album passen sich jetzt dem echten Pokémon-Karten-Seitenverhältnis an (63 × 88 mm, ≈ 1:1,40) — `_AlbumPageGrid._apply_card_aspect()` berechnet via `resizeEvent` die größtmögliche Slotgröße die in Breite **und** Höhe passt; Kartenbild skaliert mit `Qt.KeepAspectRatio` (Letterbox mit dunklem Rand)
+
+## 0.6.2 - 2026-04-26 - Album Drag-Drop & Preis-Batch
+
+### Fixed
+- `ui/album_widget.py`: Harter Absturz bei jedem Karten-Drop im Album — Windows OLE Nested Event Loop in `QDrag.exec()` zerstörte den Quell-Slot-Widget, während der C++-OLE-Thread noch lief; Fix: `drag_started`/`drag_ended`-Signalkette (`_AlbumSlot` → `_AlbumPageGrid` → `_AlbumDetailView`), `_rebuild_spread()` wird während eines aktiven Drags nie aufgerufen; `_on_slot_changed()` nutzt jetzt `grid.reload()` statt `_rebuild_spread()`
+- `ui/album_widget.py`: Karte wurde nach Auto-Flip auf neue Doppelseite nicht visuell übernommen — neue Methode `_live_navigate_to()` remappt bestehende Grids/Slots in-place während des Drags, ohne Widgets zu zerstören; `_pending_rebuild = True` sorgt für vollständigen Rebuild nach Drop-Ende
+
+### Changed
+- `db/repositories.py`: neue Methode `AlbumRepository.get_album_missing_price_api_ids(album_id)` — SQL-Query über alle Album-Seiten, liefert alle api_ids ohne Preis (kein UI-Loop über visible Slots mehr)
+- `ui/album_widget.py`: `_auto_fetch_missing_prices()` fragt jetzt das gesamte Album aller Seiten ab — ein Worker-Start fetcht alle fehlenden Preise auf einmal; Worker wird nicht neu gestartet wenn bereits einer läuft
+- `ui/album_widget.py`: `_AlbumRefreshWorker.run()` nutzt Batch-Requests (`GET /v2/cards?q=id:X OR id:Y`, 100 IDs/Batch) statt pro-Karte-Anfragen — 300-Karten-Album: 3 statt 300 HTTP-Calls
+
 ## 0.6.1 - 2026-04-25 - Bild-Stabilität & Preis-Korrektheit
 
 ### Fixed

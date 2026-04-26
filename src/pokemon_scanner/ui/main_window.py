@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import enum
 import logging
 import tempfile
 from pathlib import Path
@@ -45,7 +46,7 @@ from src.pokemon_scanner.export.exporters import export_csv, export_json, export
 from src.pokemon_scanner.recognition.matcher import CandidateMatcher
 from src.pokemon_scanner.recognition.ocr import OcrEngine
 from src.pokemon_scanner.recognition.pipeline import RecognitionPipeline
-from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, DisclaimerDialog
+from src.pokemon_scanner.ui.about_dialog import AboutDialog, ApiKeyDialog, ChangelogDialog, DisclaimerDialog
 from src.pokemon_scanner.ui.debug_dialog import DebugDialog
 from src.pokemon_scanner.ui.album_scan_dialog import AlbumScanDialog, AlbumScanWidget
 from src.pokemon_scanner.ui.title_bar import CustomTitleBar
@@ -53,6 +54,13 @@ from src.pokemon_scanner.ui.market_widget import MarktWidget
 from src.pokemon_scanner.ui.stats_widget import StatsWidget
 from src.pokemon_scanner.ui.catalog_dialog import CatalogWidget
 from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
+
+
+class _CamState(enum.IntEnum):
+    IDLE     = 0  # camera off
+    READY    = 1  # camera on, waiting for scan trigger
+    SCANNING = 2  # scan in progress (button disabled)
+    MANUAL   = 3  # manual search mode
 from src.pokemon_scanner.ui.styles import (
     size_body, size_small, size_xs, size_heading, size_large,
 )
@@ -123,16 +131,6 @@ class ManualSearchWorker(QThread):
             self.finished.emit(candidates)
         except Exception as exc:
             self.error.emit(str(exc))
-
-
-class _OcrWarmupWorker(QThread):
-    """Pre-loads the EasyOCR model in the background so the first real scan is instant."""
-
-    def run(self) -> None:
-        try:
-            OcrEngine._get_reader()
-        except Exception as exc:
-            logging.getLogger(__name__).warning("OCR warmup failed: %s", exc)
 
 
 class ScanWorker(QThread):
@@ -219,7 +217,7 @@ class MainWindow(QMainWindow):
         self._ocr_overlay_cache_key: str = ""
 
         self._active_cam_index: int = settings.last_camera_index
-        self._cam_state: int = 0
+        self._cam_state: _CamState = _CamState.IDLE
 
         self.setWindowTitle("CardLens")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -231,13 +229,8 @@ class MainWindow(QMainWindow):
         # Cooldown timestamp for wish-price alert checks (0 = never checked).
         self._wish_alert_last_checked: float = 0.0
 
-        # Pre-warm EasyOCR so the first real scan doesn't block the UI
-        self._ocr_warmup_worker = _OcrWarmupWorker(self)
-        self._ocr_warmup_worker.finished.connect(
-            lambda: self.status_label.setText("OCR-Modell bereit \u2013 Bereit zum Scannen")
-        )
-        self.status_label.setText("OCR-Modell wird geladen \u2026")
-        self._ocr_warmup_worker.start()
+        # OCR model already loaded in main thread before this window was created.
+        self._set_status("OCR-Modell bereit \u2013 Bereit zum Scannen", "success")
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -333,27 +326,27 @@ class MainWindow(QMainWindow):
         actions_menu = menu_bar.addMenu("&Aktionen")
 
         act_tcg = actions_menu.addAction("\U0001f511 TCGPlayer Key konfigurieren \u2026")
-        act_tcg.triggered.connect(self._catalog_widget._open_api_key_dialog)
+        act_tcg.triggered.connect(self._catalog_widget.open_api_key_dialog)
 
         actions_menu.addSeparator()
 
         act_prices = actions_menu.addAction("\U0001f4b0 Preise updaten")
         act_prices.setToolTip("Preise aller Katalog-Karten via pokemontcg.io aktualisieren")
-        act_prices.triggered.connect(self._catalog_widget._start_catalog_price_update)
+        act_prices.triggered.connect(self._catalog_widget.start_price_update)
 
         act_bulk = actions_menu.addAction("\u2b07 Alle Karten laden")
         act_bulk.setToolTip(
             "L\u00e4dt alle ~18\u202f000 Karten von pokemontcg.io in die lokale Datenbank.\n"
             "Nur beim ersten Start / nach einem Reset n\u00f6tig."
         )
-        act_bulk.triggered.connect(self._catalog_widget._start_bulk_download)
+        act_bulk.triggered.connect(self._catalog_widget.start_bulk_download)
 
         actions_menu.addSeparator()
 
         act_bilder = actions_menu.addAction("\U0001f4f7 Bilder beim Laden herunterladen")
         act_bilder.setCheckable(True)
         act_bilder.setChecked(False)
-        act_bilder.toggled.connect(self._catalog_widget._kat_img_cb.setChecked)
+        act_bilder.toggled.connect(self._catalog_widget.set_fetch_images)
 
         img_submenu = actions_menu.addMenu("Bildgr\u00f6\u00dfe")
         size_group = QActionGroup(img_submenu)
@@ -363,18 +356,14 @@ class MainWindow(QMainWindow):
             _act_size.setCheckable(True)
             _act_size.setChecked(_size_text == "small (~20 KB)")
             _act_size.triggered.connect(
-                lambda _checked, t=_size_text: self._catalog_widget._kat_img_size.setCurrentText(t)
+                lambda _checked, t=_size_text: self._catalog_widget.set_image_size(t)
             )
             size_group.addAction(_act_size)
 
         actions_menu.addSeparator()
 
         act_refresh = actions_menu.addAction("\U0001f504 Katalog aktualisieren")
-        act_refresh.triggered.connect(
-            lambda: self._catalog_widget._load_katalog(
-                self._catalog_widget._search_input.text().strip()
-            )
-        )
+        act_refresh.triggered.connect(self._catalog_widget.reload)
 
         actions_menu.addSeparator()
 
@@ -405,6 +394,9 @@ class MainWindow(QMainWindow):
         action_about = help_menu.addAction("\u00dcber CardLens \u2026")
         action_about.triggered.connect(self._open_about)
 
+        action_changelog = help_menu.addAction("\U0001f4cb Patchnotes / Changelog \u2026")
+        action_changelog.triggered.connect(self._open_changelog)
+
         action_disclaimer = help_menu.addAction("Lizenzen & Disclaimer \u2026")
         action_disclaimer.triggered.connect(self._open_disclaimer_readonly)
 
@@ -433,6 +425,9 @@ class MainWindow(QMainWindow):
 
     def _open_about(self) -> None:
         AboutDialog(parent=self).exec()
+
+    def _open_changelog(self) -> None:
+        ChangelogDialog(parent=self).exec()
 
     def _open_disclaimer_readonly(self) -> None:
         dlg = DisclaimerDialog(current_api_key=self.settings.pokemontcg_api_key, parent=self)
@@ -568,6 +563,7 @@ class MainWindow(QMainWindow):
             self.collection_service.repository,
             settings=self.settings,
         )
+        self._catalog_widget.search_on_market.connect(self._on_catalog_search_on_market)
         self._stack.addWidget(self._catalog_widget)
 
         # ── Page 1: Scanner ───────────────────────────────────────────────
@@ -736,6 +732,11 @@ class MainWindow(QMainWindow):
         self._markt_widget.show_tab(tab)
         self._update_title("Markt")
 
+    def _on_catalog_search_on_market(self, name: str) -> None:
+        """Navigate to Markt/Kauf and pre-fill the search with the card name."""
+        self._nav_to_markt(MarktWidget.TAB_KAUF)
+        self._markt_widget.search_card(name)
+
     def _set_nav_active(self, btn_idx: int) -> None:
         self._active_nav_idx = btn_idx
         for i, btn in enumerate(self._nav_buttons):
@@ -805,6 +806,25 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_title_bar"):
             self._title_bar.set_title(f"CardLens  –  {section}")
 
+    # ── Color-coded status bar helper ─────────────────────────────────────
+    # level: "info" (gray) | "success" (green) | "warning" (amber) | "error" (red) | "working" (blue)
+
+    def _set_status(self, text: str, level: str = "info") -> None:
+        """Set status bar text with a color indicator dot and appropriate color."""
+        _colors = {
+            "info":    ("#94a3b8", "●"),
+            "success": ("#4ade80", "✓"),
+            "warning": ("#fbbf24", "⚠"),
+            "error":   ("#f87171", "✗"),
+            "working": ("#60a5fa", "⟳"),
+        }
+        color, icon = _colors.get(level, _colors["info"])
+        self.status_label.setStyleSheet(
+            f"color:{color};font-size:{size_small()}px;padding:2px 10px;"
+            "border-top:1px solid #334155;background:#151726;"
+        )
+        self.status_label.setText(f"{icon}  {text}")
+
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
             self.showNormal()
@@ -857,7 +877,7 @@ class MainWindow(QMainWindow):
         self.btn_cam_scan.setMinimumHeight(48)
         self.btn_cam_scan.setMinimumWidth(190)
         self.btn_cam_scan.setToolTip("Kamera starten → Karte einlegen → Jetzt scannen drücken")
-        self._set_cam_btn_state(0)
+        self._set_cam_btn_state(_CamState.IDLE)
         self.btn_cam_scan.clicked.connect(self._on_cam_scan_clicked)
 
         # ── Language dropdown (placed next to camera button, below image) ─────
@@ -1117,56 +1137,57 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     # Camera 3-state button helpers
-    # State 0: camera off  → "📷 Kamera starten"
-    # State 1: camera on   → "📸 Jetzt scannen"
-    # State 2: scanning    → "⏳ Scannt …" (disabled)
+    # State IDLE:     camera off  → "📷 Kamera starten"
+    # State READY:    camera on   → "📸 Jetzt scannen"
+    # State SCANNING: scanning    → "⏳ Scannt …" (disabled)
+    # State MANUAL:   file loaded → "📸 Jetzt scannen"
     # ------------------------------------------------------------------
 
-    def _cam_btn_style(self, state: int) -> str:
+    def _cam_btn_style(self, state: _CamState) -> str:
         sz = size_heading()
         styles = {
-            0: (
+            _CamState.IDLE: (
                 f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#374151; color:#e2e8f0;"
                 " border-radius:6px; border:none; }"
                 "QPushButton:hover { background:#4b5563; }"
             ),
-            1: (
+            _CamState.READY: (
                 f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#2563eb; color:white;"
                 " border-radius:6px; border:none; }"
                 "QPushButton:hover { background:#1d4ed8; }"
                 "QPushButton:pressed { background:#1e40af; }"
             ),
-            2: (
+            _CamState.SCANNING: (
                 f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#64748b; color:#cbd5e1;"
                 " border-radius:6px; border:none; }"
             ),
-            3: (
+            _CamState.MANUAL: (
                 f"QPushButton {{ font-size:{sz}px; font-weight:bold; background:#2563eb; color:white;"
                 " border-radius:6px; border:none; }"
                 "QPushButton:hover { background:#1d4ed8; }"
                 "QPushButton:pressed { background:#1e40af; }"
             ),
         }
-        return styles.get(state, styles[0])
+        return styles.get(state, styles[_CamState.IDLE])
     _CAM_BTN_LABELS = {
-        0: "\U0001f4f7 Kamera starten",
-        1: "\U0001f4f8 Jetzt scannen",
-        2: "\u23f3 Scannt \u2026",
-        3: "\U0001f4f8 Jetzt scannen",
+        _CamState.IDLE:     "\U0001f4f7 Kamera starten",
+        _CamState.READY:    "\U0001f4f8 Jetzt scannen",
+        _CamState.SCANNING: "\u23f3 Scannt \u2026",
+        _CamState.MANUAL:   "\U0001f4f8 Jetzt scannen",
     }
 
-    def _set_cam_btn_state(self, state: int) -> None:
+    def _set_cam_btn_state(self, state: _CamState) -> None:
         self._cam_state = state
         self.btn_cam_scan.setText(self._CAM_BTN_LABELS[state])
         self.btn_cam_scan.setStyleSheet(self._cam_btn_style(state))
-        self.btn_cam_scan.setEnabled(state != 2)
+        self.btn_cam_scan.setEnabled(state != _CamState.SCANNING)
 
     def _on_cam_scan_clicked(self) -> None:
-        if self._cam_state == 0:
+        if self._cam_state == _CamState.IDLE:
             self._start_camera()
-        elif self._cam_state == 1:
+        elif self._cam_state == _CamState.READY:
             self._capture_and_scan()
-        elif self._cam_state == 3:
+        elif self._cam_state == _CamState.MANUAL:
             self.run_scan()
 
     # ------------------------------------------------------------------
@@ -1189,7 +1210,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.btn_capture_frame.setEnabled(True)
-        self._set_cam_btn_state(1)
+        self._set_cam_btn_state(_CamState.READY)
         self._camera_timer.start(66)  # ~15 fps – reduces main-thread repaint load
         self.status_label.setText(f"Kamera {idx} l\u00e4uft \u2026")
         self.logger.info("Camera %d started", idx)
@@ -1198,7 +1219,7 @@ class MainWindow(QMainWindow):
         self._camera_timer.stop()
         self.camera_service.close()
         self.btn_capture_frame.setEnabled(False)
-        self._set_cam_btn_state(0)
+        self._set_cam_btn_state(_CamState.IDLE)
         self.image_label.clear()
         self.image_label.setText("Noch kein Bild geladen")
         self.status_label.setText("Kamera gestoppt")
@@ -1360,7 +1381,7 @@ class MainWindow(QMainWindow):
         self.image_label.setPixmap(scaled)
         self.status_label.setText(f"Bild geladen: {Path(file_path).name}")
         self.logger.info("Loaded image %s", file_path)
-        self._set_cam_btn_state(3)
+        self._set_cam_btn_state(_CamState.MANUAL)
         self.run_scan()
 
     # ------------------------------------------------------------------
@@ -1373,8 +1394,8 @@ class MainWindow(QMainWindow):
             return
         if self._scan_worker is not None and self._scan_worker.isRunning():
             return
-        self._set_cam_btn_state(2)
-        self.status_label.setText("Karte wird erkannt \u2026 (erster Start l\u00e4dt OCR-Modell, kann etwas dauern)")
+        self._set_cam_btn_state(_CamState.SCANNING)
+        self._set_status("Karte wird erkannt \u2026", "working")
         self._clear_best_match()
         self._last_ocr_raw = ""
         self.candidate_table.setRowCount(0)
@@ -1390,11 +1411,11 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, candidates: list[CardCandidate], warp_path: str, raw_ocr: str = "") -> None:
         if self.camera_service.state.is_running:
-            self._set_cam_btn_state(1)
+            self._set_cam_btn_state(_CamState.READY)
         elif self.current_image_path:
-            self._set_cam_btn_state(3)
+            self._set_cam_btn_state(_CamState.MANUAL)
         else:
-            self._set_cam_btn_state(0)
+            self._set_cam_btn_state(_CamState.IDLE)
         self.current_candidates = candidates
         self._last_ocr_raw = raw_ocr
         # Show warped card preview if detection succeeded
@@ -1408,10 +1429,10 @@ class MainWindow(QMainWindow):
         if candidates:
             self._fill_candidate_table(candidates)
             warp_note = " (Karte erkannt)" if warp_path else ""
-            self.status_label.setText(f"{len(candidates)} Treffer gefunden{warp_note}")
+            self._set_status(f"{len(candidates)} Treffer gefunden{warp_note}", "success")
             self._save_to_catalog(candidates)
         else:
-            self.status_label.setText("Keine Karte erkannt \u2013 Bild pr\u00fcfen oder erneut scannen")
+            self._set_status("Keine Karte erkannt \u2013 Bild pr\u00fcfen oder erneut scannen", "warning")
         self.logger.info("Scan finished: %d candidates for %s", len(candidates), self.current_image_path)
         # Process any scan that was queued while this one was running
         if self._pending_scan_path:
@@ -1419,12 +1440,12 @@ class MainWindow(QMainWindow):
 
     def _on_scan_error(self, message: str) -> None:
         if self.camera_service.state.is_running:
-            self._set_cam_btn_state(1)
+            self._set_cam_btn_state(_CamState.READY)
         elif self.current_image_path:
-            self._set_cam_btn_state(3)
+            self._set_cam_btn_state(_CamState.MANUAL)
         else:
-            self._set_cam_btn_state(0)
-        self.status_label.setText(f"Fehler beim Scan: {message}")
+            self._set_cam_btn_state(_CamState.IDLE)
+        self._set_status(f"Fehler beim Scan: {message}", "error")
         self.logger.error("Scan error: %s", message)
         if self._pending_scan_path:
             self._execute_queued_scan()
@@ -1508,7 +1529,7 @@ class MainWindow(QMainWindow):
     def _on_manual_search_error(self, message: str) -> None:
         self.btn_manual_search.setEnabled(True)
         self.btn_manual_search.setText("Suchen")
-        self.status_label.setText(f"Suchfehler: {message}")
+        self._set_status(f"Suchfehler: {message}", "error")
         self.logger.error("Manual search error: %s", message)
 
     def _save_to_catalog(self, candidates: list[CardCandidate]) -> None:
@@ -2144,7 +2165,7 @@ class MainWindow(QMainWindow):
             self._catalog_widget.stop_workers()
         self._stop_camera()
         # Stop all background workers gracefully before exit
-        for worker in [self._scan_worker, self._manual_search_worker, self._ocr_warmup_worker]:
+        for worker in [self._scan_worker, self._manual_search_worker]:
             if worker is not None and worker.isRunning():
                 worker.quit()
                 worker.wait(2000)

@@ -48,6 +48,21 @@ def _compute_phash(image_path: str) -> str:
         return ""
 
 
+def _candidate_from_correction(correction: dict, language: str, confidence: float) -> CardCandidate:
+    """Build a CardCandidate directly from a stored OCR-correction row."""
+    return CardCandidate(
+        source="ocr_correction",
+        name=correction["correct_name"],
+        set_name=correction.get("correct_set_name", ""),
+        card_number=correction.get("correct_card_number", ""),
+        language=language or "en",
+        confidence=confidence,
+        best_price=None,
+        notes=f"ID: {correction['correct_api_id']}",
+        api_id=correction["correct_api_id"],
+    )
+
+
 class RecognitionPipeline:
     def __init__(self, database=None, pokemontcg_api_key: str = "", correction_repo=None) -> None:
         self.preprocessor = Preprocessor()
@@ -96,17 +111,7 @@ class RecognitionPipeline:
             correction = self._correction_repo.find_best_by_text(raw_query)
             if correction:
                 # Build candidate directly from stored data — no network call needed
-                direct = CardCandidate(
-                    source="ocr_correction",
-                    name=correction["correct_name"],
-                    set_name=correction.get("correct_set_name", ""),
-                    card_number=correction.get("correct_card_number", ""),
-                    language=language or "en",
-                    confidence=0.95,
-                    best_price=None,
-                    notes=f"ID: {correction['correct_api_id']}",
-                    api_id=correction["correct_api_id"],
-                )
+                direct = _candidate_from_correction(correction, language, confidence=0.95)
                 # Supplement with richer local data if available
                 local_cands = self._search_local(correction["correct_name"])
                 for c in local_cands:
@@ -133,18 +138,7 @@ class RecognitionPipeline:
             if phash:
                 correction = self._correction_repo.find_best_by_phash(phash)
                 if correction:
-                    # Build candidate directly from stored data — no network call needed
-                    direct = CardCandidate(
-                        source="ocr_correction",
-                        name=correction["correct_name"],
-                        set_name=correction.get("correct_set_name", ""),
-                        card_number=correction.get("correct_card_number", ""),
-                        language=language or "en",
-                        confidence=0.90,
-                        best_price=None,
-                        notes=f"ID: {correction['correct_api_id']}",
-                        api_id=correction["correct_api_id"],
-                    )
+                    direct = _candidate_from_correction(correction, language, confidence=0.90)
                     local_cands = self._search_local(correction["correct_name"])
                     for c in local_cands:
                         if c.api_id == correction["correct_api_id"]:

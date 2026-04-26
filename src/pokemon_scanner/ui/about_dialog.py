@@ -1,6 +1,8 @@
 """About and first-run Disclaimer dialogs for CardLens."""
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -13,11 +15,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
-_APP_VERSION = "0.4.0"
+_APP_VERSION = "0.6.2"
 
 _THIRD_PARTY = """\
 <b>PySide6 / Qt</b><br>
@@ -51,12 +54,12 @@ License: MIT<br>
 <b>pokemontcg.io API</b><br>
 Third-party web service — not affiliated with Nintendo or The Pokémon Company.<br>
 You must agree to their Terms of Service when using this app.<br>
-<a href="https://pokemontcg.io/terms">https://pokemontcg.io/terms</a><br><br>
+<a href="https://pokemontcg.io">https://pokemontcg.io</a><br><br>
 
 <b>TCGPlayer API</b><br>
 Third-party web service operated by TCGPlayer, Inc. — not affiliated with Nintendo or The Pokémon Company.<br>
 Used for sealed-product pricing (ETB, Booster Bundle). Subject to their Terms of Service.<br>
-<a href="https://store.tcgplayer.com/legal">https://store.tcgplayer.com/legal</a><br><br>
+<a href="https://www.tcgplayer.com">https://www.tcgplayer.com</a><br><br>
 
 <b>Trading Card Game Trademarks</b><br>
 CardLens is not affiliated with or endorsed by Nintendo or The Pokémon Company International.<br>
@@ -71,7 +74,7 @@ _DISCLAIMER_TEXT = """\
 CardLens ruft Karteninformationen und Preise über die <b>pokemontcg.io API</b> ab.<br>
 Du bist der Vertragspartner gegenüber pokemontcg.io — nicht der Entwickler dieser App.<br>
 Mit der Nutzung akzeptierst du deren \
-<a href="https://pokemontcg.io/terms">Nutzungsbedingungen</a>.<br>
+<a href="https://pokemontcg.io">Nutzungsbedingungen</a>.<br>
 Ein eigener API-Key erhöht das Anfragen-Limit auf 20.000/Tag (kostenlos registrieren).<br><br>
 
 <b>2. Markenzeichen</b><br>
@@ -90,7 +93,7 @@ Drittanbieter-Bibliotheken unterliegen ihren eigenen Lizenzen (LGPL, Apache 2.0,
 <b>4. TCGPlayer API</b><br>
 Kartenwerte (ETB, Booster Bundle) werden über die <b>TCGPlayer API</b> abgerufen.<br>
 Du bist der Vertragspartner gegenüber TCGPlayer, Inc. — nicht der Entwickler dieser App.<br>
-Mit der Nutzung akzeptierst du deren <a href="https://store.tcgplayer.com/legal">Nutzungsbedingungen</a>.<br><br>
+Mit der Nutzung akzeptierst du deren <a href="https://www.tcgplayer.com">Nutzungsbedingungen</a>.<br><br>
 
 <b>5. Datenspeicherung</b><br>
 Alle Daten (Sammlung, Logs) werden <b>lokal</b> auf deinem PC gespeichert.<br>
@@ -294,3 +297,107 @@ class AboutDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _md_to_html(md: str) -> str:
+    """Minimal Markdown → HTML conversion for CHANGELOG display."""
+    lines = md.splitlines()
+    html_lines: list[str] = []
+    in_ul = False
+    for raw in lines:
+        line = raw.rstrip()
+        # Heading levels
+        if line.startswith("## "):
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            html_lines.append(f"<h2 style='color:#60a5fa;margin-top:16px;margin-bottom:2px;'>{line[3:]}</h2>")
+            continue
+        if line.startswith("### "):
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            html_lines.append(f"<h3 style='color:#94a3b8;margin-top:8px;margin-bottom:2px;'>{line[4:]}</h3>")
+            continue
+        if line.startswith("# "):
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            html_lines.append(f"<h1 style='color:#e2e8f0;'>{line[2:]}</h1>")
+            continue
+        # Bullet
+        if line.startswith("- "):
+            if not in_ul:
+                html_lines.append("<ul style='margin:2px 0 2px 16px;'>")
+                in_ul = True
+            item = _inline_md(line[2:])
+            html_lines.append(f"<li style='margin:1px 0;'>{item}</li>")
+            continue
+        # Close list on blank / other line
+        if in_ul:
+            html_lines.append("</ul>")
+            in_ul = False
+        if line == "":
+            html_lines.append("<br>")
+        else:
+            html_lines.append(f"<p style='margin:2px 0;'>{_inline_md(line)}</p>")
+    if in_ul:
+        html_lines.append("</ul>")
+    return "\n".join(html_lines)
+
+
+def _inline_md(text: str) -> str:
+    """Convert inline **bold** and `code` in a line."""
+    # backtick code
+    text = re.sub(r"`([^`]+)`", r"<code style='background:#1e293b;padding:1px 4px;border-radius:3px;'>\1</code>", text)
+    # bold
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
+    return text
+
+
+class ChangelogDialog(QDialog):
+    """Scrollable Changelog / Patchnotes viewer."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Changelog / Patchnotes")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(640)
+        self.setStyleSheet("background:#0f172a; color:#e2e8f0;")
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        from src.pokemon_scanner.core.paths import PROJECT_ROOT
+        changelog_path = PROJECT_ROOT / "CHANGELOG.md"
+        if changelog_path.exists():
+            md_text = changelog_path.read_text(encoding="utf-8")
+            html = _md_to_html(md_text)
+        else:
+            html = "<i>CHANGELOG.md nicht gefunden.</i>"
+
+        browser = QTextBrowser()
+        browser.setHtml(
+            f"<html><body style='background:#0f172a;color:#e2e8f0;"
+            f"font-family:Segoe UI,Arial,sans-serif;font-size:13px;padding:8px;'>"
+            f"{html}</body></html>"
+        )
+        browser.setOpenExternalLinks(True)
+        browser.setStyleSheet(
+            "QTextBrowser { background:#0f172a; border:1px solid #334155;"
+            " border-radius:4px; color:#e2e8f0; }"
+            "QScrollBar:vertical { background:#1e293b; width:10px; }"
+            "QScrollBar::handle:vertical { background:#334155; border-radius:5px; }"
+        )
+        layout.addWidget(browser, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.Close).setStyleSheet(
+            "background:#252741; border:1px solid #334155; border-radius:4px;"
+            " color:#e2e8f0; padding:4px 16px;"
+        )
+        layout.addWidget(buttons)
+

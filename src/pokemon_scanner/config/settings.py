@@ -16,7 +16,7 @@ class AppSettings:
     default_language: str = "en"
     automode_confidence_threshold: float = 0.95
     enable_automode: bool = False
-    enable_mock_recognition: bool = True
+    enable_mock_recognition: bool = False
     last_camera_index: int = 0
     preferred_language: str = ""
     # Custom OCR name-zone (relative 0–1 fractions of the card image).

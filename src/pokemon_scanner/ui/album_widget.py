@@ -16,6 +16,7 @@ from pathlib import Path
 
 import requests as _requests
 
+from shiboken6 import isValid as _qt_is_valid
 from PySide6.QtCore import Qt, QByteArray, QEvent, QMimeData, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QDrag, QFont, QFontMetrics, QLinearGradient,
@@ -33,10 +34,26 @@ from src.pokemon_scanner.ui.styles import scale, size_card_pt
 from src.pokemon_scanner.db.catalog_repository import CatalogRepository
 from src.pokemon_scanner.db.repositories import AlbumRepository, CollectionRepository
 from src.pokemon_scanner.core.paths import CATALOG_IMAGES_DIR
-from src.pokemon_scanner.core.name_translations import find_en_names_for_de_partial
+from src.pokemon_scanner.datasources.name_translator import find_en_names_for_de_partial
 from src.pokemon_scanner.ui.image_cache import load_card_pixmap, CardImageDownloadWorker
 
 _log = logging.getLogger(__name__)
+
+
+def _crash_trace(msg: str) -> None:
+    """Write a line to logs/album_crash_trace.log and fsync immediately.
+    Used to pinpoint 100%-reproducible hard crashes that bypass Python exceptions.
+    Call BEFORE every potentially dangerous Qt operation."""
+    import datetime as _dt, os as _os
+    try:
+        from src.pokemon_scanner.core.paths import LOG_DIR as _LD
+        _LD.mkdir(parents=True, exist_ok=True)
+        with open(_LD / "album_crash_trace.log", "a", encoding="utf-8") as _f:
+            _f.write(f"{_dt.datetime.now().isoformat()} {msg}\n")
+            _f.flush()
+            _os.fsync(_f.fileno())
+    except Exception:
+        pass
 
 _SLOT_W = 63
 _SLOT_H = 88
@@ -304,6 +321,8 @@ class _AlbumSlot(QFrame):
     """One pocket in a binder page. Supports drag-and-drop rearranging."""
 
     slot_changed = Signal()
+    drag_started = Signal()  # emitted immediately before QDrag.exec() blocks
+    drag_ended = Signal()    # emitted immediately after QDrag.exec() returns
 
     def __init__(
         self,
@@ -379,8 +398,14 @@ class _AlbumSlot(QFrame):
         # Do NOT set thread to None while running — that would drop the last
         # Python ref and let GC destroy the QThread mid-run → crash.
         # finished→deleteLater (set in _start_image_fetch) handles cleanup.
-        if self._fetch_thread and self._fetch_thread.isRunning():
-            self._fetch_thread.done.disconnect()
+        # Guard against RuntimeError when the C++ QThread was already deleted
+        # by deleteLater() but the Python wrapper is still alive (dangling ref).
+        if self._fetch_thread is not None:
+            try:
+                if self._fetch_thread.isRunning():
+                    self._fetch_thread.done.disconnect()
+            except RuntimeError:
+                pass
         self._fetch_thread = None
 
         self._entry = entry
@@ -404,6 +429,16 @@ class _AlbumSlot(QFrame):
 
         self.update()
 
+    def teardown(self) -> None:
+        """Disconnect the active fetch thread.  Must be called before deleteLater()."""
+        if self._fetch_thread is not None:
+            try:
+                if self._fetch_thread.isRunning():
+                    self._fetch_thread.done.disconnect()
+            except RuntimeError:
+                pass
+            self._fetch_thread = None
+
     def _start_image_fetch(self, api_id: str, url: str) -> None:
         # No parent: Qt must NOT own the thread lifetime via parent-child —
         # if the slot widget is destroyed while downloading, Qt would delete
@@ -416,6 +451,10 @@ class _AlbumSlot(QFrame):
 
     def _on_image_fetched(self, local_path: str) -> None:
         """Called on the main thread when a background image download finishes."""
+        # Guard: the slot widget may have been destroyed (deleteLater) before
+        # this queued-connection callback fires.  isValid() checks the C++ side.
+        if not _qt_is_valid(self):
+            return
         if not local_path or self._entry is None:
             return
         self._raw_pixmap = load_card_pixmap(
@@ -441,7 +480,10 @@ class _AlbumSlot(QFrame):
                     conn.commit()
             except Exception as exc:
                 _log.warning("Could not persist image_path after download: %s", exc)
-            self.update()
+            try:
+                self.update()
+            except RuntimeError:
+                pass  # widget was already deleted before the callback fired
 
     def event(self, ev) -> bool:
         et = ev.type()
@@ -564,7 +606,9 @@ class _AlbumSlot(QFrame):
                     self._raw_pixmap.scaled(40, 56, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 )
             drag.setMimeData(mime)
+            self.drag_started.emit()
             drag.exec(Qt.MoveAction)
+            self.drag_ended.emit()
         else:
             super().mouseMoveEvent(event)
 
@@ -575,10 +619,12 @@ class _AlbumSlot(QFrame):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
+        _crash_trace(f"DROP_START self=page{self.page_num}/slot{self.slot_index}")
         raw = bytes(event.mimeData().data(_MIME_SLOT))
         try:
             src = json.loads(raw)
         except Exception:
+            _crash_trace("DROP_JSON_FAIL")
             return
         if src.get("album_id") != self.album_id:
             return
@@ -586,10 +632,12 @@ class _AlbumSlot(QFrame):
         p2, s2 = self.page_num, self.slot_index
         if (p1, s1) == (p2, s2):
             return
+        _crash_trace(f"DROP_SWAP src=page{p1}/slot{s1} dst=page{p2}/slot{s2}")
         # Capture entry IDs before the swap so we can update album_page correctly
         dragged_eid = self._album_repo.get_slot_entry_id(self.album_id, p1, s1)
         target_eid = self._entry.get("collection_entry_id") if self._entry else None
         self._album_repo.swap_slots(self.album_id, p1, s1, p2, s2)
+        _crash_trace("DROP_SWAP_DONE")
         if self._album_name:
             if dragged_eid is not None:
                 self._col_repo.update_album_page(
@@ -600,7 +648,9 @@ class _AlbumSlot(QFrame):
                     target_eid, f"{self._album_name}, Seite {p1 + 1}"
                 )
         event.acceptProposedAction()
+        _crash_trace("DROP_BEFORE_EMIT")
         self.slot_changed.emit()
+        _crash_trace("DROP_AFTER_EMIT_OK")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -611,6 +661,8 @@ class _AlbumPageGrid(QWidget):
     """One binder page rendered as a grid of _AlbumSlot widgets."""
 
     slot_changed = Signal()
+    drag_started = Signal()  # forwarded from any child _AlbumSlot
+    drag_ended = Signal()    # forwarded from any child _AlbumSlot
 
     def __init__(
         self,
@@ -640,11 +692,12 @@ class _AlbumPageGrid(QWidget):
         for c in range(cols):
             grid.setColumnStretch(c, 1)
         for r in range(rows):
-            grid.setRowStretch(r, 1)
             for c in range(cols):
                 idx = r * cols + c
                 slot = _AlbumSlot(album_id, page_num, idx, album_repo, col_repo, self._album_name)
                 slot.slot_changed.connect(self._on_slot_changed)
+                slot.drag_started.connect(self.drag_started)
+                slot.drag_ended.connect(self.drag_ended)
                 grid.addWidget(slot, r, c)
                 self._slots.append(slot)
 
@@ -654,9 +707,47 @@ class _AlbumPageGrid(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background:#1e2030; border:none;")
 
+    # ── Aspect-ratio enforcement ───────────────────────────────────────────
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_card_aspect()
+
+    def _apply_card_aspect(self) -> None:
+        """Keep every slot at the true Pokémon-card ratio (63 × 88 mm).
+
+        Uses whichever constraint (width or height) yields the smaller slot so
+        that all rows are always fully visible and nothing gets clipped.
+        """
+        grid = self.layout()
+        m = grid.contentsMargins()
+        spacing = grid.spacing()
+
+        avail_w = self.width() - m.left() - m.right() - spacing * (self._cols - 1)
+        avail_h = self.height() - m.top() - m.bottom() - spacing * (self._rows - 1)
+
+        # Candidate size derived from available width
+        sw_from_w = max(45, avail_w // self._cols)
+        sh_from_w = round(sw_from_w * 88 / 63) + _PRICE_H
+
+        # Candidate size derived from available height
+        sh_from_h = max(63 + _PRICE_H, avail_h // self._rows)
+        sw_from_h = round((sh_from_h - _PRICE_H) * 63 / 88)
+
+        # Pick the smaller of the two so slots fit in both dimensions
+        if sh_from_w <= sh_from_h:
+            slot_w, slot_h = sw_from_w, sh_from_w
+        else:
+            slot_w, slot_h = sw_from_h, sh_from_h
+
+        for slot in self._slots:
+            slot.setFixedSize(slot_w, slot_h)
+
     def _on_slot_changed(self) -> None:
+        _crash_trace("PAGE_GRID_ON_SLOT_CHANGED")
         self.reload()
+        _crash_trace("PAGE_GRID_AFTER_RELOAD")
         self.slot_changed.emit()
+        _crash_trace("PAGE_GRID_AFTER_EMIT")
 
     def reload(self) -> None:
         slot_data = self._album_repo.get_page_slots_with_entries(self._album_id, self._page_num)
@@ -672,6 +763,315 @@ class _AlbumPageGrid(QWidget):
             if slot._market_price is not None:
                 total += slot._market_price
         return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigation arrow button with drag-over support
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NavArrowButton(QPushButton):
+    """Navigation arrow (◄ / ►) that also accepts card drops.
+
+    When a card is dragged over the button:
+    * The button highlights immediately.
+    * After DROP_HOVER_MS ms the ``auto_flip`` signal fires → the spread flips.
+    On a direct drop ``page_drop(page_num, slot_index)`` is emitted so the
+    caller can move the card to the first free slot of the adjacent spread.
+    """
+
+    DROP_HOVER_MS = 800  # ms until auto-flip while hovering during drag
+
+    auto_flip = Signal()
+    page_drop = Signal(int, int)  # (src_page_num, src_slot_index)
+
+    _ACCENT = QColor("#5865f2")
+    _ACCENT_A = QColor(88, 101, 242, 80)
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self._drag_over = False
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(self.DROP_HOVER_MS)
+        self._hover_timer.timeout.connect(self._on_timer)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_MIME_SLOT) and self.isEnabled():
+            event.acceptProposedAction()
+            self._drag_over = True
+            self._hover_timer.start()
+            self.update()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragLeaveEvent(self, event) -> None:
+        self._drag_over = False
+        self._hover_timer.stop()
+        self.update()
+        super().dragLeaveEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_MIME_SLOT) and self.isEnabled():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        self._drag_over = False
+        self._hover_timer.stop()
+        self.update()
+        if event.mimeData().hasFormat(_MIME_SLOT):
+            raw = bytes(event.mimeData().data(_MIME_SLOT))
+            try:
+                src = json.loads(raw)
+            except Exception:
+                return
+            event.acceptProposedAction()
+            self.page_drop.emit(src["page_num"], src["slot_index"])
+        else:
+            super().dropEvent(event)
+
+    def _on_timer(self) -> None:
+        if self._drag_over:
+            self.auto_flip.emit()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._drag_over:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(self._ACCENT_A)
+            p.setPen(QPen(self._ACCENT, 2))
+            p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
+            p.end()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Album TOC panel (left page of spread 0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _AlbumTocPanel(QFrame):
+    """Table of contents shown as the left-hand page of the first spread."""
+
+    def __init__(
+        self,
+        album_repo: AlbumRepository,
+        album_id: int,
+        album_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._album_repo = album_repo
+        self._album_id = album_id
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setStyleSheet(
+            "QFrame{background:#252741;border:1px solid #334155;border-radius:6px;}"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+
+        # ── Header ──────────────────────────────────────────────────────────
+        hdr = QLabel("Inhaltsangabe")
+        hdr.setStyleSheet(
+            f"color:#e2e8f0;font-size:{scale(13)}px;font-weight:bold;"
+            "border:none;background:transparent;"
+        )
+        hdr.setAlignment(Qt.AlignCenter)
+        outer.addWidget(hdr)
+
+        self._total_lbl = QLabel()
+        self._total_lbl.setStyleSheet(
+            f"color:#94a3b8;font-size:{scale(11)}px;border:none;background:transparent;"
+        )
+        self._total_lbl.setAlignment(Qt.AlignCenter)
+        outer.addWidget(self._total_lbl)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(
+            "QFrame{background:#334155;border:none;max-height:1px;min-height:1px;}"
+        )
+        outer.addWidget(sep)
+
+        # ── Scrollable page list ─────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            "QScrollArea{border:none;background:#252741;}"
+            "QScrollBar:vertical{background:#1a1d2e;width:6px;border-radius:3px;}"
+            "QScrollBar::handle:vertical{background:#334155;border-radius:3px;}"
+        )
+
+        self._list_widget = QWidget()
+        self._list_widget.setStyleSheet("background:#252741;")
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setSpacing(3)
+        self._list_layout.setContentsMargins(2, 2, 2, 2)
+        self._list_layout.addStretch(1)
+        scroll.setWidget(self._list_widget)
+        outer.addWidget(scroll, 1)
+
+        self.refresh()
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _make_row(
+        self,
+        name: str,
+        value: str = "",
+        *,
+        name_color: str = "#94a3b8",
+        val_color: str = "#94a3b8",
+        name_bold: bool = False,
+        name_size: int | None = None,
+        indent: int = 0,
+        count_text: str = "",
+    ) -> QWidget:
+        """Return a single list row widget with name + optional count + value."""
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        h = QHBoxLayout(w)
+        h.setContentsMargins(indent, 0, 0, 0)
+        h.setSpacing(4)
+
+        sz = name_size if name_size is not None else scale(10)
+        weight = "bold" if name_bold else "normal"
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(
+            f"color:{name_color};font-size:{sz}px;font-weight:{weight};"
+            "border:none;background:transparent;"
+        )
+        name_lbl.setWordWrap(True)
+        h.addWidget(name_lbl, 1)
+
+        if count_text:
+            cnt_lbl = QLabel(count_text)
+            cnt_lbl.setAlignment(Qt.AlignCenter)
+            cnt_lbl.setFixedWidth(60)
+            cnt_lbl.setStyleSheet(
+                f"color:{name_color};font-size:{sz}px;"
+                "border:none;background:transparent;"
+            )
+            h.addWidget(cnt_lbl, 0)
+
+        val_lbl = QLabel(value if value else "")
+        val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        val_lbl.setFixedWidth(72)
+        val_lbl.setStyleSheet(
+            f"color:{val_color};font-size:{sz}px;"
+            "border:none;background:transparent;"
+        )
+        h.addWidget(val_lbl, 0)
+        return w
+
+    def refresh(self) -> None:
+        """Reload totals and per-page rows from the DB."""
+        totals = self._album_repo.get_album_totals(self._album_id)
+        detail_rows = self._album_repo.get_album_pages_detail(self._album_id)
+
+        market = totals["market"]
+        if market > 0:
+            self._total_lbl.setText(
+                f"Gesamtwert: € {market:.2f}".replace(".", ",")
+            )
+        else:
+            self._total_lbl.setText("Gesamtwert: –")
+
+        # Clear old rows (keep the trailing stretch)
+        while self._list_layout.count() > 1:
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Group cards by page
+        pages_data: dict[int, list[dict]] = {}
+        for r in detail_rows:
+            pages_data.setdefault(r["page_num"], []).append(r)
+
+        for page_num in sorted(pages_data.keys()):
+            cards = pages_data[page_num]
+            pg_display = page_num + 1
+            card_count = len(cards)
+            page_total = sum(c["card_value"] for c in cards)
+            page_purchase = sum(c["purchase_price"] for c in cards)
+            karten = "Karte" if card_count == 1 else "Karten"
+            total_str = f"€ {page_total:.2f}".replace(".", ",") if page_total > 0 else "–"
+
+            # G&V
+            guv_color = "#4ade80"
+            guv_str = ""
+            if page_total > 0 or page_purchase > 0:
+                guv = page_total - page_purchase
+                sign = "+" if guv >= 0 else ""
+                guv_str = f"{sign}€ {guv:.2f}".replace(".", ",")
+                guv_color = "#4ade80" if guv >= 0 else "#f87171"
+
+            # ── Page header row ──────────────────────────────────────────
+            pg_row = self._make_row(
+                f"Seite {pg_display}",
+                total_str,
+                name_color="#e2e8f0",
+                val_color="#e2e8f0",
+                name_bold=True,
+                name_size=scale(11),
+                indent=0,
+                count_text=f"{card_count} {karten}",
+            )
+            self._list_layout.insertWidget(self._list_layout.count() - 1, pg_row)
+
+            # G&V row
+            if guv_str:
+                gv_row = self._make_row(
+                    f"G&V: {guv_str}",
+                    name_color=guv_color,
+                    indent=4,
+                )
+                self._list_layout.insertWidget(self._list_layout.count() - 1, gv_row)
+
+            # Group cards by set (sorted)
+            set_groups: dict[str, list[dict]] = {}
+            for c in cards:
+                sn = c["set_name"] or "–"
+                set_groups.setdefault(sn, []).append(c)
+
+            for set_name in sorted(set_groups.keys()):
+                set_cards = sorted(set_groups[set_name], key=lambda c: c["card_name"])
+                set_total = sum(c["card_value"] for c in set_cards)
+                set_val_str = f"€ {set_total:.2f}".replace(".", ",") if set_total > 0 else "–"
+
+                # ── Set row ──────────────────────────────────────────────
+                set_row = self._make_row(
+                    set_name,
+                    set_val_str,
+                    name_color="#7dd3fc",
+                    val_color="#7dd3fc",
+                    name_bold=True,
+                    indent=8,
+                )
+                self._list_layout.insertWidget(self._list_layout.count() - 1, set_row)
+
+                # ── Card rows ────────────────────────────────────────────
+                for card in set_cards:
+                    cv = card["card_value"]
+                    cv_str = f"€ {cv:.2f}".replace(".", ",") if cv > 0 else "–"
+                    card_row = self._make_row(
+                        card["card_name"] or "–",
+                        cv_str,
+                        name_color="#94a3b8",
+                        val_color="#94a3b8",
+                        indent=16,
+                    )
+                    self._list_layout.insertWidget(self._list_layout.count() - 1, card_row)
+
+            # Spacer between pages
+            spacer = QFrame()
+            spacer.setFixedHeight(5)
+            spacer.setStyleSheet("background:transparent;border:none;")
+            self._list_layout.insertWidget(self._list_layout.count() - 1, spacer)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -702,6 +1102,12 @@ class _AlbumDetailView(QWidget):
         self._rows = 3
         self._price_worker: _AlbumRefreshWorker | None = None
         self._page_labels: list[QLabel] = []
+        # Drag-safety state: set True by drag_started signal, False by drag_ended.
+        # While True, _rebuild_spread() must NOT be called because the source slot
+        # widget is still on the QDrag call stack (Windows OLE nested loop).
+        # Instead, callers set _pending_rebuild = True; _on_drag_ended applies it.
+        self._drag_active: bool = False
+        self._pending_rebuild: bool = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -755,10 +1161,12 @@ class _AlbumDetailView(QWidget):
             "QPushButton:hover{background:#2a3060;color:#e2e8f0;}"
             "QPushButton:disabled{color:#2a3045;background:#1a1d2e;border-color:#1a1d2e;}"
         )
-        self._prev_btn = QPushButton("\u25c4")
+        self._prev_btn = _NavArrowButton("\u25c4")
         self._prev_btn.setFixedWidth(36)
         self._prev_btn.setStyleSheet(nav_btn_ss)
         self._prev_btn.clicked.connect(self._prev_spread)
+        self._prev_btn.auto_flip.connect(self._prev_spread)
+        self._prev_btn.page_drop.connect(self._on_drop_to_prev)
         spread_row.addWidget(self._prev_btn, 0, Qt.AlignVCenter)
 
         self._pages_widget = QWidget()
@@ -768,15 +1176,18 @@ class _AlbumDetailView(QWidget):
         self._pages_layout.setContentsMargins(0, 0, 0, 0)
         spread_row.addWidget(self._pages_widget, 1)
 
-        self._next_btn = QPushButton("\u25ba")
+        self._next_btn = _NavArrowButton("\u25ba")
         self._next_btn.setFixedWidth(36)
         self._next_btn.setStyleSheet(nav_btn_ss)
         self._next_btn.clicked.connect(self._next_spread)
+        self._next_btn.auto_flip.connect(self._next_spread)
+        self._next_btn.page_drop.connect(self._on_drop_to_next)
         spread_row.addWidget(self._next_btn, 0, Qt.AlignVCenter)
 
         layout.addLayout(spread_row, 1)
         self._page_grids: list[_AlbumPageGrid] = []
         self._page_labels: list[QLabel] = []
+        self._toc_panel: _AlbumTocPanel | None = None
 
     def load_album(self) -> None:
         info = self._album_repo.get_album(self._album_id)
@@ -785,7 +1196,18 @@ class _AlbumDetailView(QWidget):
         self._cols = info["cols"]
         self._rows = info["rows"]
         self._title_lbl.setText(info["name"])
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocus()
         self._refresh_pages()
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self._prev_spread()
+        elif key == Qt.Key.Key_Right:
+            self._next_spread()
+        else:
+            super().keyPressEvent(event)
 
     def eventFilter(self, obj: object, event: QEvent) -> bool:
         if obj is self._title_lbl and event.type() == QEvent.Type.MouseButtonDblClick:
@@ -810,7 +1232,9 @@ class _AlbumDetailView(QWidget):
         self._total_pages = max(2, db_count + (1 if db_count % 2 != 0 else 0))
         # Potentially expand if last page is fully filled
         self._maybe_expand_pages()
-        self._current_spread = min(self._current_spread, self._total_pages - 2)
+        # Preserve the user's current spread position even if DB has fewer pages;
+        # also ensure at least one more spread is reachable from where they are.
+        self._total_pages = max(self._total_pages, self._current_spread + 4)
         if self._current_spread < 0:
             self._current_spread = 0
         self._rebuild_spread()
@@ -824,14 +1248,37 @@ class _AlbumDetailView(QWidget):
             self._total_pages += 2
 
     def _rebuild_spread(self) -> None:
+        _crash_trace("REBUILD_START")
+        # Disconnect fetch threads on old slots BEFORE scheduling widget deletion.
+        for old_grid in self._page_grids:
+            for slot in old_grid._slots:
+                slot.teardown()
+        _crash_trace("REBUILD_AFTER_TEARDOWN")
         self._page_grids.clear()
         self._page_labels.clear()
+        self._toc_panel = None
         while self._pages_layout.count():
             item = self._pages_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        _crash_trace("REBUILD_AFTER_DELETE_LATER")
 
-        for i, page_num in enumerate([self._current_spread, self._current_spread + 1]):
+        # ── Page mapping ─────────────────────────────────────────────────────
+        # Spread 0:  [TOC | DB page 0]
+        # Spread S>0: [DB page S-1 | DB page S]
+        # DB page N → displayed label "Seite N+1"
+        if self._current_spread == 0:
+            # Left: TOC panel (not a card grid)
+            toc = _AlbumTocPanel(
+                self._album_repo, self._album_id, self._title_lbl.text()
+            )
+            self._toc_panel = toc
+            self._pages_layout.addWidget(toc, 1)
+            card_pages = [0]
+        else:
+            card_pages = [self._current_spread - 1, self._current_spread]
+
+        for page_num in card_pages:
             frame = QFrame()
             frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             frame.setStyleSheet(
@@ -854,6 +1301,8 @@ class _AlbumDetailView(QWidget):
                 frame,
             )
             grid.slot_changed.connect(self._on_slot_changed)
+            grid.drag_started.connect(self._on_drag_started)
+            grid.drag_ended.connect(self._on_drag_ended)
             grid.reload()
             val = grid.page_value()
             if val > 0:
@@ -865,25 +1314,39 @@ class _AlbumDetailView(QWidget):
             self._page_grids.append(grid)
             self._page_labels.append(pg_lbl)
 
-        total_spreads = (self._total_pages + 1) // 2
-        current_spread_idx = self._current_spread // 2 + 1
-        self._page_lbl.setText(f"Doppelseite {current_spread_idx} / {total_spreads}")
+        # ── Page counter label ────────────────────────────────────────────────
+        if self._current_spread == 0:
+            self._page_lbl.setText("Inhaltsangabe")
+        else:
+            left_num = self._current_spread       # DB page _current_spread-1 → "Seite S"
+            right_num = self._current_spread + 1  # DB page _current_spread   → "Seite S+1"
+            self._page_lbl.setText(f"Seite {left_num} · {right_num}")
+
         self._prev_btn.setEnabled(self._current_spread > 0)
-        self._next_btn.setEnabled(self._current_spread + 2 < self._total_pages)
+        self._next_btn.setEnabled(True)  # album is infinite
+        _crash_trace("REBUILD_END")
         self._update_value_lbl()
         self._auto_fetch_missing_prices()
 
     def _auto_fetch_missing_prices(self) -> None:
-        """Background-fetch prices for any filled slot that has no market_price."""
-        if self._price_worker is not None and self._price_worker.isRunning():
-            return
-        missing: list[str] = []
-        for grid in self._page_grids:
-            for slot in grid._slots:
-                if slot._entry is not None and slot._market_price is None:
-                    api_id = slot._entry.get("api_id") or ""
-                    if api_id and api_id not in missing:
-                        missing.append(api_id)
+        """Background-fetch prices for every album card that has no price yet.
+
+        Queries the DB for all pages (not just the visible spread) so one
+        worker run caches the whole album at once.
+        """
+        if self._price_worker is not None:
+            if self._price_worker.isRunning():
+                return
+            # Worker finished but not yet cleaned up.  Disconnect its signal NOW
+            # so a late-firing done() can't call _on_price_refresh_done with a
+            # stale self._price_worker reference (which would deleteLater the
+            # NEW worker we're about to create → crash).
+            try:
+                self._price_worker.done.disconnect(self._on_price_refresh_done)
+            except RuntimeError:
+                pass
+            self._price_worker = None
+        missing = self._album_repo.get_album_missing_price_api_ids(self._album_id)
         if not missing:
             return
         self._price_worker = _AlbumRefreshWorker(self._cat_repo, missing)
@@ -892,12 +1355,14 @@ class _AlbumDetailView(QWidget):
 
     def _on_price_refresh_done(self, _msg: str) -> None:
         """Reload slot data and update labels after auto price fetch."""
-        for i, (grid, lbl) in enumerate(zip(self._page_grids, self._page_labels)):
+        if not _qt_is_valid(self):
+            return
+        for grid, lbl in zip(self._page_grids, self._page_labels):
             grid.reload()
-            page_num = self._current_spread + i
+            page_num = grid._page_num
             val = grid.page_value()
             lbl.setText(
-                f"Seite {page_num + 1}  \u00b7  \u20ac {val:.2f}".replace(".", ",")
+                f"Seite {page_num + 1}  ·  € {val:.2f}".replace(".", ",")
                 if val > 0 else f"Seite {page_num + 1}"
             )
         self._update_value_lbl()
@@ -928,20 +1393,165 @@ class _AlbumDetailView(QWidget):
             )
         self._value_lbl.setText("  ·  ".join(parts))
         self._value_lbl.show()
+        # Also refresh the TOC so its totals and per-page rows stay in sync.
+        if self._toc_panel is not None and _qt_is_valid(self._toc_panel):
+            self._toc_panel.refresh()
+
+    def _on_drag_started(self) -> None:
+        """One of our slot widgets entered QDrag.exec() — mark drag in progress."""
+        self._drag_active = True
+        _crash_trace("DRAG_ACTIVE_TRUE")
+
+    def _on_drag_ended(self) -> None:
+        """QDrag.exec() returned — safe to rebuild spread now if needed."""
+        self._drag_active = False
+        _crash_trace("DRAG_ACTIVE_FALSE")
+        if self._pending_rebuild:
+            self._pending_rebuild = False
+            _crash_trace("DRAG_ENDED_TRIGGER_REFRESH")
+            # singleShot(0) defers past the current mouseMoveEvent dispatch frame
+            # before we destroy and recreate slot widgets.
+            QTimer.singleShot(0, self._refresh_pages)
+
+    def _live_navigate_to(self, spread: int) -> None:
+        """Navigate to a spread IN-PLACE during an active drag — zero widget destruction.
+
+        If the grid count would change (TOC↔cards boundary), bail immediately and
+        schedule a full rebuild for after the drag ends instead.
+        """
+        _crash_trace(f"LIVE_NAVIGATE_TO spread={spread}")
+
+        # TOC spread (0) needs 1 grid; all other spreads need 2 grids.
+        # If count changes we can't remap in-place — defer to post-drag rebuild.
+        grids_needed = 1 if spread == 0 else 2
+        if len(self._page_grids) != grids_needed:
+            self._current_spread = spread
+            self._pending_rebuild = True
+            _crash_trace(f"LIVE_NAVIGATE_TO_BAIL_GRID_COUNT spread={spread}")
+            return
+
+        self._current_spread = spread
+        self._pending_rebuild = True  # full clean rebuild after drag ends
+
+        for i, grid in enumerate(self._page_grids):
+            # New mapping: spread 0 → page 0; spread S>0 → pages S-1, S
+            new_page = i if spread == 0 else (spread - 1 + i)
+            grid._page_num = new_page
+            for slot in grid._slots:
+                slot.page_num = new_page
+            grid.reload()
+
+        # Update page labels
+        for grid, lbl in zip(self._page_grids, self._page_labels):
+            page_num = grid._page_num
+            val = grid.page_value()
+            lbl.setText(
+                f"Seite {page_num + 1}  ·  € {val:.2f}".replace(".", ",")
+                if val > 0 else f"Seite {page_num + 1}"
+            )
+
+        # Update spread counter and nav buttons
+        if spread == 0:
+            self._page_lbl.setText("Inhaltsangabe")
+        else:
+            self._page_lbl.setText(f"Seite {spread} · {spread + 1}")
+        self._prev_btn.setEnabled(spread > 0)
+        self._next_btn.setEnabled(True)  # album is infinite
+        _crash_trace(f"LIVE_NAVIGATE_TO_DONE spread={spread}")
 
     def _on_slot_changed(self) -> None:
+        """Same-spread slot changed: reload data IN-PLACE, no widget destruction."""
+        _crash_trace("DETAIL_ON_SLOT_CHANGED_RELOAD")
         self._maybe_expand_pages()
-        self._rebuild_spread()
+        for grid, lbl in zip(self._page_grids, self._page_labels):
+            grid.reload()
+            page_num = grid._page_num
+            val = grid.page_value()
+            lbl.setText(
+                f"Seite {page_num + 1}  ·  € {val:.2f}".replace(".", ",")
+                if val > 0 else f"Seite {page_num + 1}"
+            )
+        self._update_value_lbl()
+        self._auto_fetch_missing_prices()
+        _crash_trace("DETAIL_ON_SLOT_CHANGED_RELOAD_DONE")
 
     def _prev_spread(self) -> None:
         if self._current_spread >= 2:
-            self._current_spread -= 2
-            self._rebuild_spread()
+            if self._drag_active:
+                # Navigate in-place (no widget destruction) so the user sees
+                # the target spread while still holding the dragged card.
+                self._live_navigate_to(self._current_spread - 2)
+            else:
+                self._current_spread -= 2
+                self._rebuild_spread()
 
     def _next_spread(self) -> None:
-        if self._current_spread + 2 < self._total_pages:
-            self._current_spread += 2
+        new_spread = self._current_spread + 2
+        # Auto-expand so the user can always navigate forward to empty pages.
+        # Keep _total_pages at least one spread ahead so the button stays active.
+        if new_spread > self._total_pages:
+            self._total_pages = new_spread + 2  # new_spread is always even
+        if self._drag_active:
+            self._live_navigate_to(new_spread)
+        else:
+            self._current_spread = new_spread
             self._rebuild_spread()
+
+    # ── Cross-page drag-drop ──────────────────────────────────────────────────
+
+    def _on_drop_to_prev(self, src_page: int, src_slot: int) -> None:
+        """Card dropped on ◄ → move to first free slot of the previous spread."""
+        target = self._current_spread - 2
+        if target < 0:
+            return
+        self._move_card_to_spread(src_page, src_slot, target)
+
+    def _on_drop_to_next(self, src_page: int, src_slot: int) -> None:
+        """Card dropped on ► → move to first free slot of the next spread."""
+        target = self._current_spread + 2
+        if target > self._total_pages:
+            return
+        self._move_card_to_spread(src_page, src_slot, target)
+
+    def _move_card_to_spread(self, src_page: int, src_slot: int, target_spread: int) -> None:
+        """Move the card at (src_page, src_slot) to the first free slot in target_spread."""
+        _crash_trace(f"MOVE_CARD src=page{src_page}/slot{src_slot} target_spread={target_spread}")
+        slots_per_page = self._cols * self._rows
+        entry_id = self._album_repo.get_slot_entry_id(self._album_id, src_page, src_slot)
+        if entry_id is None:
+            _crash_trace("MOVE_CARD_NO_ENTRY")
+            return
+        # Determine which DB pages are visible on the target spread (new mapping).
+        # Spread 0: [TOC, page 0]; Spread S>0: [page S-1, page S]
+        target_pages = [0] if target_spread == 0 else [target_spread - 1, target_spread]
+        for page_num in target_pages:
+            filled = {
+                s["slot_index"]
+                for s in self._album_repo.get_page_slots_with_entries(self._album_id, page_num)
+            }
+            for idx in range(slots_per_page):
+                if idx not in filled:
+                    # Remove from source, place at target
+                    self._album_repo.set_slot(self._album_id, src_page, src_slot, None)
+                    self._album_repo.set_slot(self._album_id, page_num, idx, entry_id)
+                    album_name = self._title_lbl.text()
+                    if album_name:
+                        self._col_repo.update_album_page(
+                            entry_id, f"{album_name}, Seite {page_num + 1}"
+                        )
+                    self._current_spread = target_spread
+                    # CRITICAL: QTimer.singleShot(0) fires inside QDrag.exec()'s
+                    # nested OLE event loop — NOT after exec() returns.  If we
+                    # schedule _refresh_pages here, it runs before the drag is
+                    # fully cleaned up, deleteLater() fires on the source slot,
+                    # and Qt's drag finalizer accesses freed C++ memory → SIGSEGV.
+                    #
+                    # Instead, set _pending_rebuild = True.  _on_drag_ended() will
+                    # call _refresh_pages() via singleShot(0) *after* drag.exec()
+                    # has returned to mouseMoveEvent, which is safe.
+                    self._pending_rebuild = True
+                    _crash_trace("MOVE_CARD_PENDING_REBUILD_SET")
+                    return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1249,32 +1859,40 @@ class _AlbumRefreshWorker(QThread):
             self.done.emit("Keine Karten im Album.")
             return
         errors = 0
-        for i, api_id in enumerate(self._api_ids):
-            self.progress.emit(i + 1, total)
+        fetched = 0
+        _CHUNK = 100  # IDs per batch request (stays well within URL-length limits)
+        chunks = [self._api_ids[i : i + _CHUNK] for i in range(0, total, _CHUNK)]
+        for chunk_idx, chunk in enumerate(chunks):
+            self.progress.emit(min(chunk_idx * _CHUNK + 1, total), total)
             try:
+                q = " OR ".join(f"id:{aid}" for aid in chunk)
                 resp = _requests.get(
-                    f"https://api.pokemontcg.io/v2/cards/{api_id}",
-                    timeout=15,
+                    "https://api.pokemontcg.io/v2/cards",
+                    params={"q": q, "pageSize": "250"},
+                    timeout=30,
                 )
                 if resp.ok:
-                    card = resp.json().get("data", {})
-                    eur, usd = _spine_extract_prices(card)
-                    img_url = (
-                        card.get("images", {}).get("small")
-                        or card.get("images", {}).get("large")
-                        or ""
-                    )
-                    self._cat_repo.update_prices(api_id, eur, usd, image_url=img_url or None)
-                    if img_url:
-                        self._cat_repo.save_local_image(api_id, img_url)
+                    for card in resp.json().get("data", []):
+                        api_id = card.get("id", "")
+                        if not api_id:
+                            continue
+                        eur, usd = _spine_extract_prices(card)
+                        img_url = (
+                            card.get("images", {}).get("small")
+                            or card.get("images", {}).get("large")
+                            or ""
+                        )
+                        self._cat_repo.update_prices(api_id, eur, usd, image_url=img_url or None)
+                        if img_url:
+                            self._cat_repo.save_local_image(api_id, img_url)
+                        fetched += 1
                 else:
-                    errors += 1
-                    _log.warning("Album refresh HTTP %s for %s", resp.status_code, api_id)
+                    errors += len(chunk)
+                    _log.warning("Album refresh batch HTTP %s", resp.status_code)
             except Exception as exc:
-                errors += 1
-                _log.warning("Album refresh error %s: %s", api_id, exc)
-        ok = total - errors
-        msg = f"✓ {ok}/{total} Preise aktualisiert"
+                errors += len(chunk)
+                _log.warning("Album refresh batch error: %s", exc)
+        msg = f"✓ {fetched}/{total} Preise aktualisiert"
         if errors:
             msg += f" ({errors} Fehler)"
         self.done.emit(msg)

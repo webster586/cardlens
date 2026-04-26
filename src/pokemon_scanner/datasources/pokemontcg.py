@@ -11,6 +11,20 @@ from src.pokemon_scanner.datasources.base import CardCandidate
 from src.pokemon_scanner.datasources.name_translator import translate_to_en
 
 _LOG = logging.getLogger(__name__)
+
+
+class ApiAuthError(RuntimeError):
+    """Raised when the API returns 401 – invalid or missing API key."""
+
+
+class ApiRateLimitError(RuntimeError):
+    """Raised when the API returns 429 – too many requests."""
+
+
+class ApiConnectionError(RuntimeError):
+    """Raised when the API is unreachable (network down, timeout, DNS failure)."""
+
+
 _BASE_URL = "https://api.pokemontcg.io/v2/cards"
 _TIMEOUT = 20
 _CACHE_TTL = 120.0  # seconds — identical queries within 2 min reuse results
@@ -132,6 +146,26 @@ class PokemonTcgAdapter:
             )
             resp.raise_for_status()
             data = resp.json()
+        except requests.exceptions.ConnectionError as exc:
+            raise ApiConnectionError(
+                "API nicht erreichbar – Internetverbindung prüfen"
+            ) from exc
+        except requests.exceptions.Timeout as exc:
+            raise ApiConnectionError(
+                f"API-Anfrage abgebrochen (Timeout nach {_TIMEOUT}s) – Verbindung prüfen"
+            ) from exc
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status == 401:
+                raise ApiAuthError(
+                    "API-Key ungültig (401) – bitte unter Hilfe → API-Schlüssel konfigurieren"
+                ) from exc
+            if status == 429:
+                raise ApiRateLimitError(
+                    "API-Limit erreicht (429) – kurz warten und erneut versuchen"
+                ) from exc
+            _LOG.warning("PokemonTCG HTTP error %s for %r: %s", status, q, exc)
+            return []
         except requests.RequestException as exc:
             _LOG.warning("PokemonTCG API error: %s", exc)
             return []

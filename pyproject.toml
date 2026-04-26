@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cardlens"
-version = "0.4.4"
+version = "0.6.1"
 description = "Desktop app for scanning, identifying and managing TCG cards"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -12,6 +12,50 @@ keywords = ["tcg", "pokemon", "card", "scanner", "collection"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--tb=short -q"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-cov"]
+dev  = ["ruff>=0.4", "mypy>=1.10"]
+
+# ── Ruff (linter + formatter) ────────────────────────────────────────────
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function call in argument defaults
+    "SIM108", # ternary operator (readability preference)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+# ── Mypy ─────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+disallow_untyped_defs = false
+
+# ── Coverage ──────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

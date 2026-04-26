@@ -55,6 +55,47 @@ _SEED: dict[str, str] = {
 _mapping: dict[str, str] | None = None
 
 # ---------------------------------------------------------------------------
+# Romanization / phonetic aliases — maps lowercase user-typed variants
+# (pinyin, Hepburn romaji, common misspellings) → canonical English card name.
+# Covers Pokémon whose EN names come from non-Latin scripts, so neither the
+# German mapping nor the CJK mapping helps when a user types the romanized form.
+# ---------------------------------------------------------------------------
+_ROMANIZATION_ALIASES: dict[str, str] = {
+    # ── Paldean Treasures of Ruin (Chinese-derived English names) ──────────
+    "baojian":   "Chien-Pao",
+    "bao jian":  "Chien-Pao",
+    "bao-jian":  "Chien-Pao",
+    "chien pao": "Chien-Pao",
+    "chienpao":  "Chien-Pao",
+    "wochien":   "Wo-Chien",
+    "wo chien":  "Wo-Chien",
+    "wo-chien":  "Wo-Chien",
+    "chiyu":     "Chi-Yu",
+    "chi yu":    "Chi-Yu",
+    "chi-yu":    "Chi-Yu",
+    "tinglu":    "Ting-Lu",
+    "ting lu":   "Ting-Lu",
+    "ting-lu":   "Ting-Lu",
+    # ── Paldean Paradox Pokémon (Japanese-derived) ──────────────────────────
+    "koraidon":  "Koraidon",
+    "miraidon":  "Miraidon",
+    # ── Other common phonetic search variants ───────────────────────────────
+    "pichu":     "Pichu",
+    "raichu":    "Raichu",
+    "togepi":    "Togepi",
+    "togekiss":  "Togekiss",
+    "eevee":     "Eevee",
+    "umbreon":   "Umbreon",
+    "espeon":    "Espeon",
+    "vaporeon":  "Vaporeon",
+    "jolteon":   "Jolteon",
+    "flareon":   "Flareon",
+    "leafeon":   "Leafeon",
+    "glaceon":   "Glaceon",
+    "sylveon":   "Sylveon",
+}
+
+# ---------------------------------------------------------------------------
 # Trainer / item name table — maps lowercase OCR variants → canonical card name.
 # Used both to block fuzzy Pokémon matching AND to correct OCR for API search.
 # ---------------------------------------------------------------------------
@@ -180,6 +221,31 @@ def translate_de_to_en_fuzzy(name: str, cutoff: float = 0.72) -> str | None:
         idx = lower_keys.index(ci_matches[0])
         return m[keys[idx]]
     return None
+
+
+def find_en_names_for_de_partial(de_partial: str) -> list[str]:
+    """Return all English Pokémon names whose German name contains *de_partial* as a substring.
+
+    Also checks the romanization alias table (pinyin / romaji variants) so that
+    e.g. "baojian" resolves to "Chien-Pao" and "wochien" to "Wo-Chien".
+    Uses the comprehensive PokeAPI-backed mapping (all generations), unlike the
+    small hardcoded dictionary in ``core.name_translations``.
+    """
+    needle = de_partial.lower().strip()
+    if not needle:
+        return []
+    results: list[str] = []
+    # 1. Exact / substring match in romanization aliases
+    for alias, en_name in _ROMANIZATION_ALIASES.items():
+        if needle in alias or alias in needle:
+            if en_name not in results:
+                results.append(en_name)
+    # 2. German → English mapping
+    m = _get_mapping()
+    for de, en in m.items():
+        if needle in de.lower() and en not in results:
+            results.append(en)
+    return results
 
 
 def translate_to_en(name: str) -> str | None:

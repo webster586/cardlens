@@ -937,6 +937,62 @@ class AlbumRepository:
         purchase = float(row["purchase"]) if row and row["purchase"] is not None else None
         return {"market": market, "purchase": purchase}
 
+    def get_album_pages_summary(self, album_id: int) -> list[dict]:
+        """Return per-page stats for the TOC.
+
+        card_entries_raw encodes each card as ``set_name|||card_name`` joined
+        by ``||`` so the UI can group + sort cards by set name.
+        """
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.page_num,
+                    COUNT(*) AS card_count,
+                    SUM(COALESCE(ce.last_price, cc.best_price, 0.0)) AS market_value,
+                    SUM(COALESCE(ce.purchase_price, 0.0)) AS purchase_total,
+                    GROUP_CONCAT(
+                        COALESCE(ce.set_name, '') || '|||' || COALESCE(ce.name, ''),
+                        '||'
+                    ) AS card_entries_raw
+                FROM album_slots s
+                INNER JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ?
+                GROUP BY s.page_num
+                ORDER BY s.page_num
+                """,
+                (album_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_album_pages_detail(self, album_id: int) -> list[dict]:
+        """Return one row per card slot for the TOC detail view.
+
+        Columns: page_num, set_name, card_name, card_value, purchase_price.
+        Rows are ordered by page, then set name, then card name.
+        """
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.page_num,
+                    COALESCE(ce.set_name, '') AS set_name,
+                    COALESCE(ce.name, '') AS card_name,
+                    COALESCE(ce.last_price, cc.best_price, 0.0) AS card_value,
+                    COALESCE(ce.purchase_price, 0.0) AS purchase_price
+                FROM album_slots s
+                INNER JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                WHERE s.album_id = ?
+                ORDER BY s.page_num,
+                         COALESCE(ce.set_name, ''),
+                         COALESCE(ce.name, '')
+                """,
+                (album_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_page_slots_with_entries(self, album_id: int, page_num: int) -> list[dict]:
         """Return slot data for a page, joined with collection + catalog info.
 
@@ -1054,6 +1110,21 @@ class AlbumRepository:
                    FROM album_slots s
                    JOIN collection_entries ce ON ce.id = s.collection_entry_id
                    WHERE s.album_id = ? AND ce.api_id IS NOT NULL AND ce.api_id != ''""",
+                (album_id,),
+            ).fetchall()
+        return [r["api_id"] for r in rows]
+
+    def get_album_missing_price_api_ids(self, album_id: int) -> list[str]:
+        """Return api_ids for all album cards that have no price yet (all pages)."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT ce.api_id
+                   FROM album_slots s
+                   JOIN collection_entries ce ON ce.id = s.collection_entry_id
+                   LEFT JOIN card_catalog cc ON cc.api_id = ce.api_id
+                   WHERE s.album_id = ?
+                     AND ce.api_id IS NOT NULL AND ce.api_id != ''
+                     AND COALESCE(ce.last_price, cc.best_price) IS NULL""",
                 (album_id,),
             ).fetchall()
         return [r["api_id"] for r in rows]

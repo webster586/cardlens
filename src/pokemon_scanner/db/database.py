@@ -31,6 +31,20 @@ class Database:
             self._local.connection = conn
         return conn
 
+    def close_local(self) -> None:
+        """Close and discard the calling thread's SQLite connection.
+
+        Call this at the end of a QThread.run() (via try/finally) so that
+        WAL checkpoint files are not kept open by finished worker threads.
+        """
+        conn: sqlite3.Connection | None = getattr(self._local, "connection", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.connection = None
+
     def initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         schema_path = Path(__file__).with_name("schema.sql")

@@ -4,6 +4,7 @@ from itertools import groupby
 from pathlib import Path
 from typing import Any
 import requests as _requests
+from shiboken6 import isValid as _qt_is_valid
 from PySide6.QtCore import Qt, QPointF, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPixmapCache
 from PySide6.QtWidgets import (
@@ -22,7 +23,12 @@ from src.pokemon_scanner.ui.styles import scale
 
 _THUMB_W = 200
 _THUMB_H = 280
+# Edit-dialog card preview — 30% larger than catalog tile thumbnail
+_EDIT_THUMB_W = 260
+_EDIT_THUMB_H = 364
 _CARD_W = 216
+# Languages that have Cardmarket pricing via pokemontcg.io
+_CARDMARKET_LANGS: frozenset[str] = frozenset({"en", "de", "fr", "it", "es", "pt"})
 _CHECK = "\u2714"
 # Approximate tile height (margins + thumb + labels + selection row)
 _TILE_H = _THUMB_H + 196
@@ -222,8 +228,9 @@ class _CardDetailDialog(QDialog):
         self._orig_values: dict = {}
 
         self._any_saved = False
+        self._price_fetch_worker: _SingleCardPriceWorker | None = None
         self.setModal(True)
-        self.resize(480, 760)
+        self.resize(520, 860)
         self.setStyleSheet(
             "QDialog { background: #1e2030; }"
             "QLabel  { color: #e2e8f0; }"
@@ -256,7 +263,7 @@ class _CardDetailDialog(QDialog):
         img_row = QHBoxLayout()
         img_row.setContentsMargins(0, 0, 0, 0)
         self._img_lbl = QLabel()
-        self._img_lbl.setFixedSize(_THUMB_W, _THUMB_H)
+        self._img_lbl.setFixedSize(_EDIT_THUMB_W, _EDIT_THUMB_H)
         self._img_lbl.setAlignment(Qt.AlignCenter)
         self._img_lbl.setStyleSheet(
             "border: 1px solid #334155; background: #111827; border-radius: 6px;"
@@ -386,6 +393,33 @@ class _CardDetailDialog(QDialog):
         _pp_widget.setLayout(_pp_row)
         form.addRow("Einkaufspreis:", _pp_widget)
 
+        # ── Marktpreis (read-only) ────────────────────────────────────────
+        self._market_price_lbl = QLabel("–")
+        self._market_price_lbl.setStyleSheet(
+            f"color:#94a3b8;font-size:{scale(13)}px;"
+        )
+        self._pp_refresh_btn = QPushButton("⟳")
+        self._pp_refresh_btn.setFixedSize(22, 22)
+        self._pp_refresh_btn.setToolTip("Aktuellen Marktpreis laden")
+        self._pp_refresh_btn.setStyleSheet(
+            "QPushButton{background:#252741;border:1px solid #334155;border-radius:4px;"
+            f"color:#60a5fa;font-size:{scale(13)}px;padding:0;min-width:22px;max-width:22px;"
+            "min-height:22px;max-height:22px;text-align:center;}"
+            "QPushButton:hover{background:#1e3a5f;border-color:#60a5fa;color:white;}"
+            "QPushButton:disabled{color:#334155;border-color:#1e2030;}"
+        )
+        self._pp_refresh_btn.clicked.connect(self._fetch_market_price)
+        if not self._cat_entry.get("api_id"):
+            self._pp_refresh_btn.setEnabled(False)
+            self._pp_refresh_btn.setToolTip("Kein API-ID – kein Preis abrufbar")
+        _mp_row = QHBoxLayout()
+        _mp_row.setSpacing(4)
+        _mp_row.addWidget(self._market_price_lbl, 1)
+        _mp_row.addWidget(self._pp_refresh_btn)
+        _mp_widget = QWidget()
+        _mp_widget.setLayout(_mp_row)
+        form.addRow("Marktpreis:", _mp_widget)
+
         main.addWidget(grp)
 
         # ── Buttons ───────────────────────────────────────────────────────
@@ -456,6 +490,32 @@ class _CardDetailDialog(QDialog):
         if li >= 0:
             self._lang.setCurrentIndex(li)
 
+        # Language-based market-price availability
+        if lang_code and lang_code not in _CARDMARKET_LANGS:
+            self._market_price_lbl.setText("–")
+            self._market_price_lbl.setStyleSheet(
+                f"color:#94a3b8;font-size:{scale(13)}px;"
+            )
+            self._pp_refresh_btn.setEnabled(False)
+            self._pp_refresh_btn.setToolTip(
+                "Kein Marktpreis verfügbar – "
+                "Cardmarket listet diese Sprache nicht auf pokemontcg.io"
+            )
+        else:
+            # Restore button in case we navigated from a non-western entry
+            if self._cat_entry.get("api_id"):
+                self._pp_refresh_btn.setEnabled(True)
+                self._pp_refresh_btn.setToolTip("Aktuellen Marktpreis laden")
+            # Pre-fill from cached catalog price
+            _cached_price = self._cat_entry.get("best_price")
+            if _cached_price is not None:
+                _cached_cur = self._cat_entry.get("price_currency") or "EUR"
+                _sym = "€" if _cached_cur == "EUR" else "$" if _cached_cur == "USD" else _cached_cur
+                self._market_price_lbl.setText(f"{_sym} {float(_cached_price):.2f}  (Katalog)")
+                self._market_price_lbl.setStyleSheet(
+                    f"color:#94a3b8;font-size:{scale(13)}px;"
+                )
+
         finish = row.get("finish") or (
             "holo" if row.get("is_foil") else ""
         )
@@ -476,7 +536,7 @@ class _CardDetailDialog(QDialog):
         # Update image label (cat_entry carries the correct local_image_path)
         local = resolve_card_image(api_id=self._cat_entry.get("api_id"), stored_hint=self._cat_entry.get("local_image_path"))
         if local:
-            px = QPixmap(local).scaled(_THUMB_W, _THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            px = QPixmap(local).scaled(_EDIT_THUMB_W, _EDIT_THUMB_H, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self._img_lbl.setPixmap(px)
             self._img_lbl.setStyleSheet(
                 "border: 1px solid #334155; background: #111827; border-radius: 6px;"
@@ -508,6 +568,42 @@ class _CardDetailDialog(QDialog):
         self._current_idx += delta
         self._load_entry(self._siblings[self._current_idx])
 
+    def _fetch_market_price(self) -> None:
+        if self._price_fetch_worker and self._price_fetch_worker.isRunning():
+            return
+        _cur_lang = self._lang.currentData() or ""
+        if _cur_lang and _cur_lang not in _CARDMARKET_LANGS:
+            return
+        api_id = self._cat_entry.get("api_id", "")
+        if not api_id:
+            return
+        self._pp_refresh_btn.setEnabled(False)
+        self._pp_refresh_btn.setText("…")
+        self._price_fetch_worker = _SingleCardPriceWorker(api_id)
+        self._price_fetch_worker.fetched.connect(self._on_market_price_fetched)
+        self._price_fetch_worker.error.connect(self._on_market_price_error)
+        self._price_fetch_worker.start()
+
+    def _on_market_price_fetched(self, price: float, currency: str) -> None:
+        if not _qt_is_valid(self._pp_refresh_btn):
+            return
+        self._pp_refresh_btn.setEnabled(True)
+        self._pp_refresh_btn.setText("⟳")
+        self._pp_refresh_btn.setToolTip("Aktuellen Marktpreis laden")
+        source = "Cardmarket" if currency == "EUR" else "TCGPlayer"
+        symbol = "€" if currency == "EUR" else "$"
+        self._market_price_lbl.setText(f"{symbol} {price:.2f}  ({source})")
+        self._market_price_lbl.setStyleSheet("color:#e2e8f0;")
+
+    def _on_market_price_error(self, msg: str) -> None:
+        if not _qt_is_valid(self._pp_refresh_btn):
+            return
+        self._pp_refresh_btn.setEnabled(True)
+        self._pp_refresh_btn.setText("⟳")
+        self._pp_refresh_btn.setToolTip("Aktuellen Marktpreis laden")
+        self._market_price_lbl.setText(f"Fehler: {msg}")
+        self._market_price_lbl.setStyleSheet("color:#ef4444;")
+
     def _save(self, *, close: bool = True) -> None:
         pp = self._purchase_price.value()
         self._col_repo.update_entry(
@@ -527,15 +623,18 @@ class _CardDetailDialog(QDialog):
         else:
             self._btn_save.setText("✓ Gespeichert")
             self._btn_save.setEnabled(False)
-            QTimer.singleShot(1500, lambda: (
-                self._btn_save.setText("Speichern"),
-                self._btn_save.setEnabled(True),
-            ))
+            def _reset_save_btn() -> None:
+                if not _qt_is_valid(self._btn_save):
+                    return
+                self._btn_save.setText("Speichern")
+                self._btn_save.setEnabled(True)
+            QTimer.singleShot(1500, _reset_save_btn)
 
 
 class _CardTile(QFrame):
     remove_requested = Signal(int)   # entry id
     detail_requested = Signal(int)   # entry id (owned cards only)
+    context_menu_requested = Signal(dict)  # entry dict
 
     def __init__(self, entry: dict, owned_row: dict | None, p: QWidget | None = None) -> None:
         super().__init__(p)
@@ -765,6 +864,9 @@ class _CardTile(QFrame):
             eid = self._owned_row.get("id")
             if eid:
                 self.detail_requested.emit(eid)
+
+    def contextMenuEvent(self, event) -> None:
+        self.context_menu_requested.emit(self._entry)
 
     def get_selection(self) -> tuple[dict, int] | None:
         """Return (entry, quantity) if this tile is selected, else None."""
@@ -997,6 +1099,7 @@ class _YearSection(QWidget):
     """Collapsible year section: set tiles in a grid, click opens that set's cards."""
     remove_requested = Signal(int)
     detail_requested = Signal(int)  # entry id
+    context_menu_requested = Signal(dict)  # entry dict
 
     def __init__(
         self,
@@ -1120,6 +1223,7 @@ class _YearSection(QWidget):
                 if owned_row:
                     tile.remove_requested.connect(self.remove_requested)
                     tile.detail_requested.connect(self.detail_requested)
+                tile.context_menu_requested.connect(self.context_menu_requested)
                 tiles.append(tile)
             self._card_grids[set_name] = _FlowGrid(tiles)
         lay.addWidget(self._card_grids[set_name])
@@ -1245,6 +1349,7 @@ class _FlowGrid(QWidget):
 class _CollapsibleSet(QWidget):
     """A set section that starts collapsed; tiles are built lazily on first expand."""
     remove_requested = Signal(int)
+    context_menu_requested = Signal(dict)  # entry dict
 
     def __init__(
         self,
@@ -1302,6 +1407,7 @@ class _CollapsibleSet(QWidget):
             tile = _CardTile(entry, owned_row)
             if owned_row:
                 tile.remove_requested.connect(self.remove_requested)
+            tile.context_menu_requested.connect(self.context_menu_requested)
             tiles.append(tile)
         self._flow = _FlowGrid(tiles)
         self._content_layout.addWidget(self._flow)
@@ -1565,79 +1671,106 @@ class _BackfillApiIdWorker(QThread):
         cat_repo: CatalogRepository,
         col_repo: CollectionRepository,
         missing: list[dict],   # collection rows without api_id
+        api_key: str = "",
     ) -> None:
         super().__init__()
         self._cat_repo = cat_repo
         self._col_repo = col_repo
         self._missing = missing
+        self._api_key = api_key
         self._log = _logging.getLogger(__name__)
 
     def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import datetime as _dt
+
         total = len(self._missing)
-        for i, row in enumerate(self._missing, 1):
+        if total == 0:
+            self.status.emit("Backfill fertig (0 Karten).")
+            self.done.emit()
+            return
+
+        def _fetch_one(row: dict) -> tuple[dict, dict | None]:
+            """Fetch matching card from API. Runs in executor thread."""
             name = row.get("name") or ""
             number = row.get("card_number") or ""
             set_name = row.get("set_name") or ""
-            self.status.emit(f"Suche API-ID {i}/{total}: {name} #{number}")
-            try:
-                # Try name + number search
-                q = f'name:"{name}" number:{number}' if number else f'name:"{name}"'
-                resp = _requests.get(
-                    "https://api.pokemontcg.io/v2/cards",
-                    params={"q": q, "pageSize": 10, "orderBy": "-set.releaseDate"},
-                    timeout=15,
-                )
-                if not resp.ok:
-                    self._log.warning("Backfill HTTP %s for %s", resp.status_code, name)
-                    continue
-                cards = resp.json().get("data", [])
-                # Pick best match: same set name preferred, else first result
-                match = None
-                for c in cards:
-                    if c.get("set", {}).get("name", "").lower() == set_name.lower():
-                        match = c
-                        break
-                if not match and cards:
-                    match = cards[0]
-                if not match:
-                    self._log.warning("No API match for %s #%s", name, number)
-                    continue
-                api_id = match.get("id", "")
-                if not api_id:
-                    continue
-                # Write api_id to collection
-                self._col_repo.set_api_id(row["id"], api_id)
-                # Upsert into catalog
-                price = self._extract_price(match)
-                img_url = (
-                    match.get("images", {}).get("small")
-                    or match.get("images", {}).get("large")
-                    or ""
-                )
-                set_logo_url = match.get("set", {}).get("images", {}).get("logo", "")
-                now = _dt.datetime.utcnow().isoformat()
-                with self._cat_repo.database.connect() as conn:
-                    conn.execute(
-                        """INSERT OR REPLACE INTO card_catalog
-                           (api_id,name,set_name,card_number,language,best_price,price_currency,
-                            image_url,local_image_path,set_logo_url,set_local_logo_path,fetched_at,updated_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (api_id, match.get("name",""),
-                         match.get("set",{}).get("name",""),
-                         match.get("number",""),
-                         match.get("language","en") or "en",
-                         price, "USD", img_url, None,
-                         set_logo_url, None, now, now)
+            q = f'name:"{name}" number:{number}' if number else f'name:"{name}"'
+            resp = _requests.get(
+                "https://api.pokemontcg.io/v2/cards",
+                params={"q": q, "pageSize": 10, "orderBy": "-set.releaseDate"},
+                headers={"X-Api-Key": self._api_key} if self._api_key else {},
+                timeout=15,
+            )
+            if not resp.ok:
+                return row, None
+            cards = resp.json().get("data", [])
+            match = None
+            for c in cards:
+                if c.get("set", {}).get("name", "").lower() == set_name.lower():
+                    match = c
+                    break
+            if not match and cards:
+                match = cards[0]
+            return row, match
+
+        errors = 0
+        completed = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_fetch_one, row): row for row in self._missing}
+            for fut in as_completed(futures):
+                completed += 1
+                self.status.emit(f"Suche API-ID {completed}/{total}…")
+                try:
+                    row, match = fut.result()
+                    name = row.get("name") or ""
+                    number = row.get("card_number") or ""
+                    if match is None:
+                        self._log.warning("No API match for %s #%s", name, number)
+                        errors += 1
+                        continue
+                    api_id = match.get("id", "")
+                    if not api_id:
+                        errors += 1
+                        continue
+                    # Write api_id to collection
+                    self._col_repo.set_api_id(row["id"], api_id)
+                    # Upsert into catalog
+                    price = self._extract_price(match)
+                    img_url = (
+                        match.get("images", {}).get("small")
+                        or match.get("images", {}).get("large")
+                        or ""
                     )
-                    conn.commit()
-                if img_url:
-                    self._cat_repo.save_local_image(api_id, img_url)
-                self._log.info("Backfilled %s #%s → %s", name, number, api_id)
-            except Exception as exc:
-                self._log.warning("Backfill error for %s: %s", name, exc)
-                self.status.emit(f"Fehler bei {name}: {exc}")
-        self.status.emit(f"Backfill fertig ({total} Karten).")
+                    set_logo_url = match.get("set", {}).get("images", {}).get("logo", "")
+                    now = _dt.datetime.utcnow().isoformat()
+                    with self._cat_repo.database.connect() as conn:
+                        conn.execute(
+                            """INSERT OR REPLACE INTO card_catalog
+                               (api_id,name,set_name,card_number,language,best_price,price_currency,
+                                image_url,local_image_path,set_logo_url,set_local_logo_path,fetched_at,updated_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                api_id, match.get("name", ""),
+                                match.get("set", {}).get("name", ""),
+                                match.get("number", ""),
+                                match.get("language", "en") or "en",
+                                price, "USD", img_url, None,
+                                set_logo_url, None, now, now,
+                            ),
+                        )
+                        conn.commit()
+                    if img_url:
+                        self._cat_repo.save_local_image(api_id, img_url)
+                    self._log.info("Backfilled %s #%s → %s", name, number, api_id)
+                except Exception as exc:
+                    errors += 1
+                    orig_row = futures[fut]
+                    orig_name = orig_row.get("name") or ""
+                    self._log.warning("Backfill error for %s: %s", orig_name, exc)
+                    self.status.emit(f"Fehler bei {orig_name}: {exc}")
+        self.status.emit(f"Backfill fertig: {total - errors}/{total} OK.")
+        self._cat_repo.database.close_local()
         self.done.emit()
 
     @staticmethod
@@ -1681,6 +1814,62 @@ class _MissingImagesWorker(QThread):
         self.done.emit()
 
 
+class _SingleCardPriceWorker(QThread):
+    """Fetches the current market price for a single card api_id from pokemontcg.io."""
+    fetched = Signal(float, str)   # (price, currency)
+    error   = Signal(str)
+
+    def __init__(self, api_id: str) -> None:
+        super().__init__()
+        self._api_id = api_id
+        self._log = _logging.getLogger(__name__)
+
+    def run(self) -> None:
+        try:
+            resp = _requests.get(
+                f"https://api.pokemontcg.io/v2/cards/{self._api_id}",
+                headers={"User-Agent": "CardLens/1.0"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            card = resp.json().get("data", {})
+            # EUR (Cardmarket) first, fallback USD (TCGPlayer)
+            eur = None
+            for key in ("averageSellPrice", "trendPrice", "lowPrice"):
+                p = card.get("cardmarket", {}).get("prices", {}).get(key)
+                if p is not None:
+                    eur = round(float(p), 2)
+                    break
+            usd = None
+            for variant in ("normal", "holofoil", "reverseHolofoil",
+                            "1stEditionHolofoil", "1stEditionNormal"):
+                p = card.get("tcgplayer", {}).get("prices", {}).get(variant, {}).get("market")
+                if p is not None:
+                    usd = round(float(p), 2)
+                    break
+            if eur is not None:
+                self.fetched.emit(eur, "EUR")
+            elif usd is not None:
+                self.fetched.emit(usd, "USD")
+            else:
+                self.error.emit("Kein Preis in API-Antwort gefunden.")
+        except Exception as exc:
+            self._log.warning("SingleCardPriceWorker error for %s: %s", self._api_id, exc)
+            msg = str(exc)
+            if "timed out" in msg.lower() or "timeout" in msg.lower():
+                friendly = "Netzwerk-Timeout (api.pokemontcg.io)"
+            elif "connection" in msg.lower() or "name or service" in msg.lower():
+                friendly = "Keine Verbindung zu api.pokemontcg.io"
+            else:
+                friendly = msg if len(msg) <= 60 else msg[:57] + "…"
+            self.error.emit(friendly)
+        finally:
+            try:
+                pass  # no DB connection to close
+            except Exception:
+                pass
+
+
 class _RefreshWorker(QThread):
     """Fetches fresh prices + missing images for all collection entries via pokemontcg.io."""
     progress = Signal(int, int)
@@ -1695,34 +1884,66 @@ class _RefreshWorker(QThread):
 
     def run(self) -> None:
         total = len(self._api_ids)
+        if total == 0:
+            self.status.emit("Keine Karten zum Aktualisieren.")
+            self.done.emit()
+            return
         errors = 0
-        for i, api_id in enumerate(self._api_ids):
-            self.progress.emit(i + 1, total)
-            self.status.emit(f"Preis-Update {i+1}/{total}: {api_id}")
+        fetched = 0
+        # ≤250 IDs → single batch request; otherwise chunks of 100
+        _CHUNK = 100
+        chunks = (
+            [self._api_ids]
+            if total <= 250
+            else [self._api_ids[i : i + _CHUNK] for i in range(0, total, _CHUNK)]
+        )
+        for chunk_idx, chunk in enumerate(chunks):
+            self.progress.emit(min(chunk_idx * _CHUNK + 1, total), total)
+            if len(chunks) > 1:
+                self.status.emit(
+                    f"Preis-Update Batch {chunk_idx + 1}/{len(chunks)} ({len(chunk)} Karten)…"
+                )
+            else:
+                self.status.emit(f"Preis-Update ({len(chunk)} Karten)…")
             try:
+                q = " OR ".join(f"id:{aid}" for aid in chunk)
                 resp = _requests.get(
-                    f"https://api.pokemontcg.io/v2/cards/{api_id}",
-                    timeout=15,
+                    "https://api.pokemontcg.io/v2/cards",
+                    params={"q": q, "pageSize": "250"},
+                    timeout=30,
                 )
                 if resp.ok:
-                    card = resp.json().get("data", {})
-                    eur, usd = self._extract_prices(card)
-                    img_url = (
-                        card.get("images", {}).get("small")
-                        or card.get("images", {}).get("large")
-                        or ""
-                    )
-                    self._repo.update_prices(api_id, eur, usd, image_url=img_url or None)
-                    if img_url:
-                        self._repo.save_local_image(api_id, img_url)
+                    cards_by_id = {
+                        c.get("id", ""): c for c in resp.json().get("data", [])
+                    }
+                    for api_id in chunk:
+                        card = cards_by_id.get(api_id)
+                        if card is None:
+                            errors += 1
+                            self._log.warning(
+                                "Refresh: ID nicht in Batch-Antwort: %s", api_id
+                            )
+                            continue
+                        eur, usd = self._extract_prices(card)
+                        img_url = (
+                            card.get("images", {}).get("small")
+                            or card.get("images", {}).get("large")
+                            or ""
+                        )
+                        self._repo.update_prices(api_id, eur, usd, image_url=img_url or None)
+                        if img_url:
+                            self._repo.save_local_image(api_id, img_url)
+                        fetched += 1
                 else:
-                    errors += 1
-                    self._log.warning("Refresh HTTP %s for %s", resp.status_code, api_id)
+                    errors += len(chunk)
+                    self._log.warning(
+                        "Refresh HTTP %s für Batch %s", resp.status_code, chunk_idx + 1
+                    )
             except Exception as exc:
-                errors += 1
-                self._log.warning("Refresh error for %s: %s", api_id, exc)
-                self.status.emit(f"Fehler bei {api_id}: {exc}")
-        summary = f"Refresh fertig: {total - errors}/{total} OK"
+                errors += len(chunk)
+                self._log.warning("Refresh Batch-Fehler: %s", exc)
+                self.status.emit(f"Fehler in Batch {chunk_idx + 1}: {exc}")
+        summary = f"Refresh fertig: {fetched}/{total} OK"
         if errors:
             summary += f", {errors} Fehler (siehe Log)"
         self.status.emit(summary)
@@ -1811,6 +2032,8 @@ class _KatalogDataWorker(QThread):
             owned = self._col_repo.get_owned_lookup()
         except Exception:
             unique, year_map, owned = [], {}, {}
+        finally:
+            self._repo.database.close_local()
         self.done.emit(unique, year_map, owned)
 
 
@@ -1874,6 +2097,8 @@ class _SammlungDataWorker(QThread):
             removed, col_rows, cat_by_api, year_map_s, samm_logo, owned_lookup = (
                 0, [], {}, {}, {}, {}
             )
+        finally:
+            self._repo.database.close_local()
         self.done.emit(removed, col_rows, cat_by_api, year_map_s, samm_logo, owned_lookup)
 
 
@@ -2266,6 +2491,7 @@ class _TopPerformerWorker(QThread):
 class _TopRow(QFrame):
     """Single clickable row in the Top-Performer table."""
     selected = Signal(dict)
+    context_menu_requested = Signal(dict)  # entry dict
     _H = 88
 
     def __init__(
@@ -2421,12 +2647,18 @@ class _TopRow(QFrame):
 
     def mousePressEvent(self, event) -> None:
         super().mousePressEvent(event)
-        self.selected.emit(self._entry)
+        if event.button() == Qt.LeftButton:
+            self.selected.emit(self._entry)
+
+    def contextMenuEvent(self, event) -> None:
+        self.context_menu_requested.emit(self._entry)
+
 
 
 class _TopPerformerWidget(QWidget):
     """Full Top-Performer tab: filter bar + lazy scrollable table."""
     _PAGE_SIZE = 100
+    context_menu_requested = Signal(dict)  # entry dict
 
     def __init__(
         self,
@@ -2646,6 +2878,7 @@ class _TopPerformerWidget(QWidget):
             owned = bool(self._owned_lookup.get(entry.get("api_id") or ""))
             row = _TopRow(i + 1, entry, owned)
             row.selected.connect(self._on_row_selected)
+            row.context_menu_requested.connect(self.context_menu_requested)
             self._rows_layout.insertWidget(insert_pos + (i - start), row)
         self._visible_count = end
         remaining = len(self._all_rows) - self._visible_count
@@ -2700,6 +2933,7 @@ class _TopPerformerWidget(QWidget):
             owned = bool(self._owned_lookup.get(entry.get("api_id") or ""))
             row = _TopRow(i + 1, entry, owned)
             row.selected.connect(self._on_row_selected)
+            row.context_menu_requested.connect(self.context_menu_requested)
             self._rows_layout.insertWidget(insert_pos + i, row)
         self._visible_count = end
         self._update_hdr_buttons()
@@ -2790,6 +3024,8 @@ class _TopPerformerWidget(QWidget):
 
 
 class CatalogWidget(QWidget):
+    search_on_market = Signal(str)   # card name → navigate to Markt + pre-fill
+
     def __init__(
         self,
         catalog_repo: CatalogRepository,
@@ -2801,8 +3037,6 @@ class CatalogWidget(QWidget):
         self._repo = catalog_repo
         self._col_repo = collection_repo
         self._settings = settings
-        # Increase pixmap cache to 50 MB (default is 10 MB)
-        QPixmapCache.setCacheLimit(51_200)
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -2941,6 +3175,10 @@ class CatalogWidget(QWidget):
         self._bulk_download_worker: _BulkDownloadWorker | None = None
         self._katalog_data_worker: _KatalogDataWorker | None = None
         self._sammlung_data_worker: _SammlungDataWorker | None = None
+        # Workers that have been superseded but may still be running — keep alive
+        # until the OS thread finishes so Qt's QThread::~QThread() never fires on
+        # a live thread (avoids the qFatal "Destroyed while thread is still running").
+        self._retiring_workers: list = []
         self._bulk_image_worker: _BulkImageWorker | None = None
         self._backfill_worker: _BackfillApiIdWorker | None = None
         self._logo_worker: _SetLogoDownloadWorker | None = None
@@ -2960,6 +3198,7 @@ class CatalogWidget(QWidget):
 
         # ── Top-Performer tab ────────────────────────────────────────────────
         self._top_widget = _TopPerformerWidget(catalog_repo, collection_repo)
+        self._top_widget.context_menu_requested.connect(self._on_card_context_menu)
         self._tabs.addTab(self._top_widget, "\U0001f3c6  Top-Performer")
 
         self._tabs.currentChanged.connect(self._on_tab_changed)
@@ -3011,6 +3250,11 @@ class CatalogWidget(QWidget):
             if w is not None and w.isRunning():
                 w.quit()
                 w.wait(2000)
+        # Also wait for any superseded workers still finishing their OS thread.
+        for w in list(self._retiring_workers):
+            if w.isRunning():
+                w.wait(2000)
+        self._retiring_workers.clear()
         self._top_widget.stop_workers()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -3019,6 +3263,99 @@ class CatalogWidget(QWidget):
 
     def _owned_map(self) -> dict:
         return self._col_repo.get_owned_lookup()
+
+    # ── Context-menu handler (Katalog / Sammlung / Top-Performer) ─────────────
+
+    def _on_card_context_menu(self, entry: dict) -> None:
+        """Show right-click context menu for any card tile or top-performer row."""
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QCursor
+        name = entry.get("name") or ""
+        api_id = entry.get("api_id") or ""
+        best_price = entry.get("best_price")
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu{background:#1e2030;color:#e2e8f0;border:1px solid #334155;"
+            "font-size:12px;padding:4px 0;}"
+            "QMenu::item{padding:6px 24px 6px 16px;}"
+            "QMenu::item:selected{background:#2563eb;color:#ffffff;}"
+            "QMenu::separator{height:1px;background:#334155;margin:4px 8px;}"
+        )
+        act_search = menu.addAction(f"\U0001f50d  Auf Markt suchen  \u2013  {name}")
+        menu.addSeparator()
+        act_alarm = menu.addAction("\U0001f514  Preisalarm erstellen \u2026")
+        if not name:
+            act_search.setEnabled(False)
+        if not api_id:
+            act_alarm.setEnabled(False)
+
+        chosen = menu.exec(QCursor.pos())
+        if chosen is act_search and name:
+            self.search_on_market.emit(name)
+        elif chosen is act_alarm and api_id:
+            self._create_price_alarm(api_id, name, best_price)
+
+    def _create_price_alarm(
+        self, api_id: str, name: str, current_price: float | None
+    ) -> None:
+        """Open a small dialog to set a wish-price alert for this card."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Preisalarm – {name}")
+        dlg.setFixedWidth(340)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        info = QLabel(
+            f"Setze einen Wunschpreis für <b>{name}</b>.<br>"
+            "Du wirst beim nächsten App-Start benachrichtigt, wenn der<br>"
+            "Marktpreis diesen Wert erreicht oder unterschreitet."
+        )
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.RichText)
+        info.setStyleSheet("font-size:11px;color:#94a3b8;")
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        spin = QDoubleSpinBox()
+        spin.setRange(0.01, 99_999.0)
+        spin.setDecimals(2)
+        spin.setSuffix(" €")
+        spin.setMinimumHeight(32)
+        if current_price is not None:
+            spin.setValue(round(current_price * 0.9, 2))  # pre-fill at 90% of current
+        else:
+            spin.setValue(1.0)
+        form.addRow("Wunschpreis:", spin)
+        lay.addLayout(form)
+
+        btns = QHBoxLayout()
+        btn_cancel = QPushButton("Abbrechen")
+        btn_save = QPushButton("Alarm setzen")
+        btn_save.setStyleSheet(
+            "QPushButton{background:#2563eb;color:white;font-weight:bold;"
+            "border-radius:4px;padding:0 12px;}"
+            "QPushButton:hover{background:#1d4ed8;}"
+        )
+        btn_save.setMinimumHeight(32)
+        btns.addStretch()
+        btns.addWidget(btn_cancel)
+        btns.addWidget(btn_save)
+        lay.addLayout(btns)
+
+        btn_cancel.clicked.connect(dlg.reject)
+
+        def _save() -> None:
+            wish = spin.value()
+            self._col_repo.set_wish_price(api_id, wish)
+            self._set_status(
+                f"\U0001f514 Preisalarm für {name} gesetzt: {wish:.2f} €", 
+            )
+            dlg.accept()
+
+        btn_save.clicked.connect(_save)
+        dlg.exec()
 
     def _open_api_key_dialog(self) -> None:
         """Open a small dialog to enter/save TCGPlayer API credentials."""
@@ -3119,11 +3456,21 @@ class CatalogWidget(QWidget):
         vbox.addWidget(loading)
         vbox.addStretch(1)
 
-        # Abort previous worker if still running
+        # Retire previous worker if still running: keep Python reference alive
+        # until the OS thread finishes so Qt never destructs a live QThread.
+        # (quit() is a no-op for blocking workers; overwriting the reference
+        # while the thread is still running causes qFatal + Windows crash.)
         if self._katalog_data_worker and self._katalog_data_worker.isRunning():
-            self._katalog_data_worker.done.disconnect()
-            self._katalog_data_worker.quit()
-            self._katalog_data_worker.wait(1000)
+            old_kw = self._katalog_data_worker
+            try:
+                old_kw.done.disconnect()
+            except RuntimeError:
+                pass
+            self._retiring_workers.append(old_kw)
+            old_kw.finished.connect(
+                lambda w=old_kw: self._retiring_workers.remove(w)
+                if w in self._retiring_workers else None
+            )
 
         self._katalog_data_worker = _KatalogDataWorker(self._repo, self._col_repo, query)
         self._katalog_data_worker.done.connect(
@@ -3178,6 +3525,7 @@ class CatalogWidget(QWidget):
                 section.remove_requested.connect(self._on_remove_card)
                 if hasattr(section, 'detail_requested'):
                     section.detail_requested.connect(self._open_card_detail)
+                section.context_menu_requested.connect(self._on_card_context_menu)
                 section.expand_for_search()
                 self._kat_sections.append(section)
                 vbox.addWidget(section)
@@ -3206,6 +3554,7 @@ class CatalogWidget(QWidget):
                 section = _YearSection(year, sets_info, owned)
                 section.remove_requested.connect(self._on_remove_card)
                 section.detail_requested.connect(self._open_card_detail)
+                section.context_menu_requested.connect(self._on_card_context_menu)
                 self._tile_by_setname.update(section.tiles_by_name())
                 self._kat_sections.append(section)
                 vbox.addWidget(section)
@@ -3287,6 +3636,7 @@ class CatalogWidget(QWidget):
             section = _YearSection(year, sets_info, owned_lookup)
             section.remove_requested.connect(self._on_remove_card)
             section.detail_requested.connect(self._open_card_detail)
+            section.context_menu_requested.connect(self._on_card_context_menu)
             vbox.addWidget(section)
 
         vbox.addStretch(1)
@@ -3302,7 +3652,10 @@ class CatalogWidget(QWidget):
             for r in missing_api:
                 self._backfill_attempted_ids.add(r["id"])
             self._set_status(f"Suche API-IDs für {len(missing_api)} Karten …")
-            self._backfill_worker = _BackfillApiIdWorker(self._repo, self._col_repo, missing_api)
+            self._backfill_worker = _BackfillApiIdWorker(
+                self._repo, self._col_repo, missing_api,
+                api_key=self._settings.pokemontcg_api_key if self._settings else "",
+            )
             self._backfill_worker.status.connect(self._set_status)
             self._backfill_worker.done.connect(lambda: self._load_sammlung(_fetch_images=True))
             self._backfill_worker.start()
@@ -3689,6 +4042,35 @@ class CatalogWidget(QWidget):
         """Called when user switches between 'Karten' and 'Alben' subtabs."""
         if index == 1:  # Alben
             self._alben_widget.refresh()
+
+    # ------------------------------------------------------------------
+    # Public API — used by MainWindow._build_menu() and other callers.
+    # These replace direct access to private members from outside the class.
+    # ------------------------------------------------------------------
+
+    def open_api_key_dialog(self) -> None:
+        """Open the pokemontcg.io / TCGPlayer API-key configuration dialog."""
+        self._open_api_key_dialog()
+
+    def start_price_update(self) -> None:
+        """Trigger a catalog price refresh via pokemontcg.io."""
+        self._start_catalog_price_update()
+
+    def start_bulk_download(self) -> None:
+        """Download all ~18 000 cards from pokemontcg.io into the local DB."""
+        self._start_bulk_download()
+
+    def set_fetch_images(self, enabled: bool) -> None:
+        """Enable or disable image download when loading the catalog."""
+        self._kat_img_cb.setChecked(enabled)
+
+    def set_image_size(self, size_text: str) -> None:
+        """Set the image-size combo ('small (~20 KB)', 'large (~100 KB)', 'beide')."""
+        self._kat_img_size.setCurrentText(size_text)
+
+    def reload(self) -> None:
+        """Reload the catalog using the current search text."""
+        self._load_katalog(self._search_input.text().strip())
 
 
 # Backward-compatibility alias

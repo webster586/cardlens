@@ -1507,6 +1507,11 @@ class _KaufWidget(QWidget):
             # No catalog repo: client-side filter on already-loaded collection data
             self._apply_filter()
 
+    def pre_fill(self, name: str) -> None:
+        """Pre-fill the search box and trigger a search — called from context menu."""
+        self._search.setText(name)
+        self._load_search()
+
     def _on_loaded(self, rows: list) -> None:
         self._all_rows = rows
         self._apply_filter()
@@ -1956,6 +1961,11 @@ class MarktWidget(QWidget):
     def show_tab(self, idx: int) -> None:
         self._tabs.setCurrentIndex(idx)
         self._on_tab_changed(idx)
+
+    def search_card(self, name: str) -> None:
+        """Navigate to Kauf tab and pre-fill search with the given card name."""
+        self.show_tab(self.TAB_KAUF)
+        self._kauf_w.pre_fill(name)
 
     def _on_tab_changed(self, idx: int) -> None:
         if idx == self.TAB_KAUF:

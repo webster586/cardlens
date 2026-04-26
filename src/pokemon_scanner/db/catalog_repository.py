@@ -483,14 +483,15 @@ class CatalogRepository:
         return [dict(r) for r in rows]
 
     def search(self, query: str) -> list[dict[str, Any]]:
-        from src.pokemon_scanner.core.name_translations import translate_to_en, translate_to_de
+        from src.pokemon_scanner.core.name_translations import translate_to_de
+        from src.pokemon_scanner.datasources.name_translator import translate_de_to_en
 
         prefix_q = f"{query}%"
         any_q = f"%{query}%"
 
         # Build extra name terms for DE↔EN cross-search
         q_lower = query.lower().strip()
-        en_equiv = translate_to_en(q_lower)   # DE input  → EN name
+        en_equiv = translate_de_to_en(q_lower)  # DE input  → EN name
         de_equiv = translate_to_de(q_lower)   # EN input  → DE name
 
         # Collect all LIKE patterns to OR together for the name column
